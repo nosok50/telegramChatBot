@@ -9,11 +9,17 @@ from config import BOT_TOKEN, COMMANDS
 from database import create_tables
 
 # Импорт модулей
-from modules import admin, moderation, user, games # Добавлен games
+from modules import admin, moderation, user, games 
+
+# !!! ИМПОРТ ФУНКЦИИ ДЛЯ RENDER !!!
+from keep_alive import keep_alive 
 
 async def main():
     logging.basicConfig(level=logging.INFO)
     
+    # !!! ЗАПУСК ВЕБ-СЕРВЕРА ПЕРЕД СТАРТОМ БОТА !!!
+    keep_alive()
+
     # Инициализация БД
     await create_tables()
     
@@ -24,14 +30,11 @@ async def main():
     dp = Dispatcher()
 
     # Регистрация роутеров
-    dp.include_router(admin.router)      # Админка
-    dp.include_router(moderation.router) # Модерация
-    dp.include_router(user.router)       # Пользовательские (XP, Profile, Rep)
-    dp.include_router(games.router)      # Игры (Dice, Duel) - НОВОЕ
+    dp.include_router(admin.router)
+    dp.include_router(moderation.router)
+    dp.include_router(user.router)
+    dp.include_router(games.router)
 
-    # Установка команд в меню
-    # Добавляем новые команды в список для удобства, если они не в config
-    # Но лучше обновить config.py. Предполагаем, что COMMANDS берется оттуда.
     await bot.set_my_commands(COMMANDS, scope=BotCommandScopeDefault())
 
     print("🚀 Бот запущен! Система уровней 2.0 активирована.")
