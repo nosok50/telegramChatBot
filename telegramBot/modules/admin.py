@@ -1,10 +1,11 @@
 ﻿# -*- coding: utf-8 -*-
+import math
 from aiogram import Router, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from database import add_to_list, get_list, manage_warn, remove_from_list
+from database import add_to_list, get_list, manage_warn, remove_from_list, clear_list_data
 from config import OWNER_ID
 from utils import answer_temp, delete_later
 
@@ -33,12 +34,44 @@ def whitelist_kb():
         [InlineKeyboardButton(text="🔙 В главное меню", callback_data="nav_main")]
     ])
 
-def badwords_kb():
+# Модифицированная клавиатура для badwords с поддержкой страниц
+def badwords_kb(page=0, total_pages=1):
+    kb = []
+    
+    # Кнопки навигации (только если страниц > 1)
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"show_badwords:{page-1}"))
+        else:
+            nav_row.append(InlineKeyboardButton(text="⏺", callback_data="ignore"))
+            
+        nav_row.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="ignore"))
+        
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"show_badwords:{page+1}"))
+        else:
+            nav_row.append(InlineKeyboardButton(text="⏺", callback_data="ignore"))
+        
+        kb.append(nav_row)
+    else:
+        # Если страница одна, оставляем кнопку "Показать" для обновления
+        kb.append([InlineKeyboardButton(text="👁 Показать список", callback_data="show_badwords:0")])
+
+    kb.append([InlineKeyboardButton(text="➕ Добавить", callback_data="add_badword"),
+               InlineKeyboardButton(text="➖ Удалить", callback_data="del_badword")])
+    
+    # Кнопка очистки всего списка
+    kb.append([InlineKeyboardButton(text="🗑 Очистить весь список", callback_data="ask_clear_badwords")])
+    
+    kb.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="nav_main")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def confirm_clear_kb(section):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👁 Показать список", callback_data="show_badwords")],
-        [InlineKeyboardButton(text="➕ Добавить", callback_data="add_badword"),
-         InlineKeyboardButton(text="➖ Удалить", callback_data="del_badword")],
-        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="nav_main")]
+        [InlineKeyboardButton(text="✅ Да, очистить всё", callback_data=f"confirm_clear_{section}")],
+        [InlineKeyboardButton(text="❌ Нет, отмена", callback_data=f"nav_{section}")]
     ])
 
 def cancel_kb(section):
@@ -98,6 +131,10 @@ async def nav_bw(clb: CallbackQuery):
         parse_mode="HTML"
     )
 
+@router.callback_query(F.data == "ignore")
+async def ignore_click(clb: CallbackQuery):
+    await clb.answer()
+
 # --- ПРОСМОТР СПИСКОВ ---
 
 @router.callback_query(F.data == "show_whitelist")
@@ -110,14 +147,61 @@ async def show_wl(clb: CallbackQuery):
     
     await clb.message.edit_text(text, reply_markup=whitelist_kb(), parse_mode="HTML")
 
-@router.callback_query(F.data == "show_badwords")
+# ОБНОВЛЕННАЯ ФУНКЦИЯ ПРОСМОТРА BADWORDS С ПАГИНАЦИЕЙ
+@router.callback_query(F.data.startswith("show_badwords"))
 async def show_bw(clb: CallbackQuery):
+    # Парсим номер страницы из callback_data (format: show_badwords:page_num)
+    try:
+        page = int(clb.data.split(":")[1])
+    except IndexError:
+        page = 0
+
     items = await get_list('badwords')
-    text = "🤬 <b>Фильтр слов:</b>\n\n" + (", ".join([f"<code>{i}</code>" for i in items]) if items else "<i>Список пуст</i>")
     
-    if len(text) > 4000: text = text[:4000] + "\n..."
+    # Настройки пагинации
+    ITEMS_PER_PAGE = 50
+    total_items = len(items)
+    total_pages = math.ceil(total_items / ITEMS_PER_PAGE)
     
-    await clb.message.edit_text(text, reply_markup=badwords_kb(), parse_mode="HTML")
+    # Если список пуст
+    if total_items == 0:
+        text = "🤬 <b>Фильтр слов:</b>\n\n<i>Список пуст</i>"
+        await clb.message.edit_text(text, reply_markup=badwords_kb(0, 1), parse_mode="HTML")
+        return
+
+    # Корректируем страницу если вышли за пределы
+    if page >= total_pages: page = total_pages - 1
+    if page < 0: page = 0
+
+    # Срез данных
+    start = page * ITEMS_PER_PAGE
+    end = start + ITEMS_PER_PAGE
+    current_items = items[start:end]
+
+    # Формируем текст
+    text_items = ", ".join([f"<code>{i}</code>" for i in current_items])
+    text = (f"🤬 <b>Фильтр слов</b> (Стр. {page+1}/{total_pages}):\n"
+            f"Всего слов: {total_items}\n\n"
+            f"{text_items}")
+    
+    await clb.message.edit_text(text, reply_markup=badwords_kb(page, total_pages), parse_mode="HTML")
+
+# --- ОЧИСТКА СПИСКА ---
+
+@router.callback_query(F.data == "ask_clear_badwords")
+async def ask_clear_bw(clb: CallbackQuery):
+    await clb.message.edit_text(
+        "🗑 <b>Вы уверены, что хотите очистить весь список запрещенных слов?</b>\n"
+        "Это действие нельзя отменить.",
+        reply_markup=confirm_clear_kb("badwords"),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "confirm_clear_badwords")
+async def confirm_clear_bw(clb: CallbackQuery):
+    await clear_list_data('badwords')
+    await clb.answer("Список полностью очищен!", show_alert=True)
+    await nav_bw(clb)
 
 # --- ДОБАВЛЕНИЕ ---
 
