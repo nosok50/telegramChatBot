@@ -241,7 +241,9 @@ async def add_to_list(table, item):
 
 async def remove_from_list(table, item):
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(f'DELETE FROM {table} WHERE item = ?', (item.lower(),))
+        # Исправлено: выбираем правильное имя столбца в зависимости от таблицы
+        field = 'item' if table == 'whitelist' else 'word'
+        await db.execute(f'DELETE FROM {table} WHERE {field} = ?', (item.lower(),))
         await db.commit()
 
 async def get_list(table):
