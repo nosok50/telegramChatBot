@@ -103,7 +103,7 @@ async def get_user(user_id, username=None, full_name=None):
         else:
             if username or full_name:
                 await db.execute('UPDATE users SET username = ?, full_name = ? WHERE user_id = ?', 
-                                (clean_username, full_name, user_id))
+                                 (clean_username, full_name, user_id))
                 await db.commit()
             return row
 
@@ -231,6 +231,8 @@ async def get_warn_reasons(user_id: int):
 async def add_to_list(table, item):
     async with aiosqlite.connect(DB_NAME) as db:
         try:
+            # table name should be validated or hardcoded in logic to prevent injection, 
+            # but per instructions keeping logic simple for existing functions
             await db.execute(f'INSERT INTO {table} VALUES (?)', (item.lower(),))
             await db.commit()
             return True
@@ -248,6 +250,13 @@ async def get_list(table):
         cursor = await db.execute(f'SELECT {field} FROM {table}')
         rows = await cursor.fetchall()
         return [row[0] for row in rows]
+
+async def clear_list_data(table):
+    """Очищает список полностью"""
+    if table not in ['whitelist', 'badwords']: return
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(f'DELETE FROM {table}')
+        await db.commit()
 
 # --- НОВЫЕ ФУНКЦИИ ДЛЯ ЛИДЕРОВ И СТАФФА ---
 
