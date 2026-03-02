@@ -1,11 +1,21 @@
 ﻿# -*- coding: utf-8 -*-
 import math
+from datetime import datetime
 from aiogram import Router, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from database import add_to_list, get_list, manage_warn, remove_from_list, clear_list_data
+from database import (
+    add_to_list,
+    get_list,
+    manage_warn,
+    remove_from_list,
+    clear_list_data,
+    get_db_sync_status,
+    trigger_manual_sync,
+    get_user,
+)
 from config import OWNER_ID
 from utils import answer_temp, delete_later
 
@@ -16,6 +26,34 @@ class AdminStates(StatesGroup):
     waiting_del_wl = State()
     waiting_add_bw = State()
     waiting_del_bw = State()
+
+
+async def can_view_db_status_user(chat: types.Chat, user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+
+    try:
+        user_data = await get_user(user_id)
+        if user_data and len(user_data) > 6 and (user_data[6] or 0) >= 2:
+            return True
+    except Exception:
+        pass
+
+    if chat.type != "private":
+        try:
+            member = await chat.get_member(user_id)
+            if member.status in ["creator", "administrator"]:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+async def can_view_db_status(message: types.Message) -> bool:
+    if not message.from_user:
+        return False
+    return await can_view_db_status_user(message.chat, message.from_user.id)
 
 # --- КЛАВИАТУРЫ ---
 
@@ -88,8 +126,8 @@ async def open_admin(message: types.Message):
         return
     await delete_later(message, 0)
     
-    # Используем message.answer, так как answer_temp не поддерживает reply_markup в вашей версии utils
-    await message.answer(
+    await answer_temp(
+        message,
         "⚙️ <b>Панель управления ботом</b>\n"
         "Выберите раздел настроек:", 
         reply_markup=main_admin_kb(),
@@ -237,7 +275,8 @@ async def process_add_wl(message: types.Message, state: FSMContext):
         if await add_to_list('whitelist', item):
             count += 1
             
-    await message.answer(
+    await answer_temp(
+        message,
         f"✅ <b>Добавлено {count} записей</b> в Белый список.", 
         reply_markup=whitelist_kb(),
         parse_mode="HTML"
@@ -254,7 +293,8 @@ async def process_add_bw(message: types.Message, state: FSMContext):
         if await add_to_list('badwords', item):
             count += 1
             
-    await message.answer(
+    await answer_temp(
+        message,
         f"✅ <b>Добавлено {count} слов</b> в Фильтр.", 
         reply_markup=badwords_kb(),
         parse_mode="HTML"
@@ -291,7 +331,8 @@ async def process_del_wl(message: types.Message, state: FSMContext):
     for item in items:
         await remove_from_list('whitelist', item)
             
-    await message.answer(
+    await answer_temp(
+        message,
         f"✅ <b>Обработано удаление {len(items)} записей</b> из Белого списка.", 
         reply_markup=whitelist_kb(),
         parse_mode="HTML"
@@ -306,7 +347,8 @@ async def process_del_bw(message: types.Message, state: FSMContext):
     for item in items:
         await remove_from_list('badwords', item)
             
-    await message.answer(
+    await answer_temp(
+        message,
         f"✅ <b>Обработано удаление {len(items)} слов</b> из Фильтра.", 
         reply_markup=badwords_kb(),
         parse_mode="HTML"
@@ -326,3 +368,55 @@ async def admin_reset(message: types.Message):
     target_name = message.reply_to_message.from_user.full_name
     await manage_warn(message.reply_to_message.from_user.id, "reset")
     await answer_temp(message, f"✅ Предупреждения для <b>{target_name}</b> полностью сброшены.")
+
+
+@router.message(Command("dbstatus"))
+async def db_status(message: types.Message):
+    await delete_later(message, 0)
+    if not await can_view_db_status(message):
+        return
+
+    status = await get_db_sync_status()
+    last_sync = status["last_sync_at"]
+    last_sync_str = datetime.fromtimestamp(last_sync).strftime("%Y-%m-%d %H:%M:%S") if last_sync else "никогда"
+    next_try = status["next_sync_attempt_at"]
+    next_try_str = datetime.fromtimestamp(next_try).strftime("%Y-%m-%d %H:%M:%S") if next_try else "сейчас"
+    dirty = ", ".join(status["dirty_tables"]) if status["dirty_tables"] else "нет"
+
+    text = (
+        "🗄 <b>Статус БД</b>\n\n"
+        f"• <b>Локальная БД (файл):</b>\n<code>{status['db_path']}</code>\n"
+        f"• <b>Neon настроен:</b> <code>{status['neon_configured']}</code>\n"
+        f"• <b>Neon сейчас подключен:</b> <code>{status['neon_connected']}</code>\n"
+        f"• <b>Таблицы с несинхронизированными изменениями:</b>\n<code>{dirty}</code>\n"
+        f"• <b>Счетчик локальных изменений с прошлого sync:</b> <code>{status['local_change_count']}</code>\n"
+        f"• <b>Последняя успешная синхронизация:</b> <code>{last_sync_str}</code>\n"
+        f"• <b>Следующая попытка синхронизации не раньше:</b> <code>{next_try_str}</code>\n\n"
+        f"⚙️ <b>Пороговые параметры синка</b>\n"
+        f"• Проверка условий синка: <code>только при новых записях</code>, но не чаще <code>{status['sync_check_interval']}s</code>\n"
+        f"• Минимальный интервал между sync: <code>{status['sync_min_interval']}s</code>\n"
+        f"• Интервал retry при ошибке Neon: <code>{status['sync_retry_interval']}s</code>\n"
+        f"• Минимум накопленных изменений для штатного sync: <code>{status['sync_min_local_changes']}</code>\n"
+        f"• Форс-sync при долгом долге: <code>{status['sync_max_dirty_age']}s</code>\n\n"
+        f"📩 <b>Кому идут DB-уведомления:</b> <code>{status['alert_user_id']}</code>\n"
+        f"• <b>Последняя ошибка Neon:</b> <code>{status['last_neon_error'] or 'нет'}</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Запулить сейчас", callback_data="db_sync_now")]
+    ])
+    await answer_temp(message, text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "db_sync_now")
+async def db_sync_now(clb: CallbackQuery):
+    if not await can_view_db_status_user(clb.message.chat, clb.from_user.id):
+        await clb.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    res = await trigger_manual_sync()
+    await clb.answer("Готово" if res["ok"] else "Ошибка", show_alert=False)
+    await answer_temp(
+        clb.message,
+        f"🧩 <b>Ручной sync</b>\n{res['message']}",
+        user_id=clb.from_user.id,
+    )

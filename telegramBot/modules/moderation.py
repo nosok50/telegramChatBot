@@ -10,7 +10,7 @@ from config import WARN_LIMIT, OWNER_ID
 from database import (
     get_list, manage_warn, get_user, 
     set_moderator_level, get_user_stats_full,
-    update_xp
+    update_xp, reset_free_dice_cooldown
 )
 from utils import (
     answer_temp, get_user_link, delete_later, 
@@ -109,7 +109,7 @@ class FloodMiddleware(BaseMiddleware):
                         pass
                     return 
                 elif flood_status == 'warn':
-                    await answer_temp(event, f"⚠️ {user_link}, не отправляйте много сообщений подряд.", delay=5, key=f"flood_warn_{user_id}")
+                    await answer_temp(event, f"⚠️ {user_link}, не отправляйте много сообщений подряд.")
                     return 
 
         return await handler(event, data)
@@ -206,11 +206,11 @@ async def handle_bad_content(message: types.Message, reason: str):
 async def cmd_mute(message: types.Message, command: CommandObject):
     await delete_later(message, 0)
     if not await is_admin(message.chat, message.from_user.id, message.sender_chat, required_level=LVL_HELPER): 
-        return await answer_temp(message, "Нет прав (Нужен <b>Moder¹</b>).", key=f"perm_err_{message.from_user.id}")
+        return await answer_temp(message, "Нет прав (Нужен <b>Moder¹</b>).")
 
     data = await parse_command_complex(message, command.args)
     if not data['target_id']: 
-        return await answer_temp(message, "Укажите цель.", key=f"args_err_{message.from_user.id}")
+        return await answer_temp(message, "Укажите цель.")
     
     sender_lvl = await get_sender_level(message.chat, message.from_user.id)
     target_lvl = await get_sender_level(message.chat, data['target_id'])
@@ -405,6 +405,26 @@ async def cmd_unban(message: types.Message, command: CommandObject):
     except: 
         await answer_temp(message, "Ошибка снятия блокировки.")
 
+
+@router.message(Command("resetdice", "resetcubecd", "freedicereset"))
+async def cmd_reset_free_dice_cd(message: types.Message, command: CommandObject):
+    await delete_later(message, 0)
+    if not await is_admin(message.chat, message.from_user.id, message.sender_chat, required_level=LVL_SENIOR):
+        return await answer_temp(message, "Нужен уровень <b>Moder³</b>.")
+
+    data = await parse_command_complex(message, command.args)
+    if not data["target_id"]:
+        return await answer_temp(message, "Укажите цель.")
+
+    sender_lvl = await get_sender_level(message.chat, message.from_user.id)
+    target_lvl = await get_sender_level(message.chat, data["target_id"])
+    if target_lvl >= sender_lvl and message.from_user.id != OWNER_ID:
+        return await answer_temp(message, "Нельзя сбросить КД равному или старшему.")
+
+    await reset_free_dice_cooldown(data["target_id"])
+    target_link = get_user_link(data["target_id"], data["target_name"])
+    await answer_temp(message, f"🎁 КД бесплатного кубика сброшен для {target_link}.")
+
 # --- УРОВЕНЬ МЕНЕДЖЕРА: ВЫДАЧА ПРАВ (promote) ---
 
 @router.message(Command("promote", "setlevel"))
@@ -501,6 +521,7 @@ async def cmd_modhelp(message: types.Message):
         "<b>Moder³</b>\n"
         "• <code>/ban @username [причина] [Длительность]</code> — Заблокировать пользователя. Формат времени: 1d 1h 1m 1s\n"
         "• <code>/unban @username</code> — Снять блокировку с пользователя\n\n"
+        "• <code>/resetdice @username</code> — Сбросить КД бесплатного кубика (можно и reply)\n\n"
         "<b>Manager</b>\n"
         "• <code>/setlevel @username [0-3]</code> — Назначить пользователю звание персонала.\n"
         "• <code>/addxp @username [количество]</code> — Выдать пользователю опыт"
@@ -510,5 +531,4 @@ async def cmd_modhelp(message: types.Message):
         message, 
         text, 
         delay=60,
-        key=f"staff_global_{message.chat.id}" 
     )

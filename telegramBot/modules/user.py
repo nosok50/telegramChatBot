@@ -5,12 +5,13 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 from database import (
     get_user, update_xp, get_warn_reasons, get_id_by_username, 
     LEVEL_CAPS, give_reputation, check_wipe_cooldown,
-    get_top_users, get_user_rank, get_all_staff 
+    get_top_users, get_user_rank, get_all_staff,
+    get_free_dice_remaining, claim_free_dice,
 )
-from config import DEFAULT_XP_PER_MSG, WARN_LIMIT, OWNER_ID
+from config import WARN_LIMIT, OWNER_ID
 from utils import delete_later, answer_temp, get_user_link
-import random
 import time
+import asyncio
 from datetime import datetime
 
 router = Router()
@@ -19,15 +20,13 @@ router = Router()
 user_last_msg = {}
 media_cooldown = {}
 chat_last_active = {}
-last_welcome_messages = {}
-
-# КЕШ ДЛЯ ПРОФИЛЕЙ: {user_id: message_id}
-profile_messages = {}
 
 # URL КАРТИНОК
 IMG_LEVEL_3 = "https://i.ibb.co/S45s7p2D/Frame-26085979.png"
 IMG_LEVEL_4 = "https://i.ibb.co/KjQGJMKL/Frame-26085980.png"
 IMG_LEVEL_5 = "https://i.ibb.co/9HCSx0g2/Frame-26085981.png"
+IMG_LEVEL_1 = "https://i.ibb.co/v69WY9bc/Frame-26086039.png"
+IMG_LEVEL_2 = "https://i.ibb.co/TM2Np5Nc/Frame-26086040.png"
 IMG_HELP_LEADERS = "https://i.ibb.co/JwC8C58d/Frame-26085985.png"
 IMG_WELCOME = "https://i.ibb.co/Q3GG72fN/Frame-26085986.png"
 
@@ -60,7 +59,7 @@ def format_xp(value):
 
 # Хелпер для кнопки игры
 def get_game_btn_simple(game_key, user_level, title, callback_base, owner_id):
-    GAME_REQS = {'dice': 3, 'slots': 3, 'basketball': 4, 'duel': 4}
+    GAME_REQS = {"dice": 1, "slots": 2, "duel": 2, "basketball": 3}
     req_lvl = GAME_REQS.get(game_key, 0)
     
     if user_level >= req_lvl:
@@ -68,18 +67,67 @@ def get_game_btn_simple(game_key, user_level, title, callback_base, owner_id):
     else:
         return InlineKeyboardButton(text=f"🔒 {req_lvl} Ур.", callback_data=f"locked_game:{req_lvl}")
 
+
+def format_dice_cooldown(seconds: int) -> str:
+    if seconds <= 0:
+        return "доступен"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours > 0:
+        return f"{hours}ч {minutes}м"
+    return f"{minutes}м {secs}с"
+
+
+def help_main_text(user_level: int) -> str:
+    return (
+        "📚 <b>СПРАВКА И УРОВНИ</b>\n\n"
+        "<b>Уровень 1:</b>\n"
+        "• <code>/profile</code> — ваш профиль\n"
+        "• <code>/games</code> — доступ к игровой зоне\n"
+        "• 🎲 Кости\n\n"
+        "<b>Уровень 2:</b>\n"
+        "• <code>/leaders</code> — топ игроков\n"
+        "• 🎰 Рулетка\n"
+        "• 🔫 Дуэль\n\n"
+        "<b>Уровень 3:</b>\n"
+        "• 🏀 Баскетбол\n"
+        "• <code>/staff</code> — состав персонала\n\n"
+        "<b>Уровень 4:</b>\n"
+        "• Ответ <code>+rep</code> — дать репутацию\n"
+        "• <code>/profile @username</code> — чужой профиль\n\n"
+        "<b>Уровень 5:</b>\n"
+        "• Ответ <code>/wipe</code> — удалить сообщение (1 раз в сутки)\n\n"
+        f"Ваш уровень: <b>{user_level}</b>"
+    )
+
+
+def help_xp_text() -> str:
+    return (
+        "💡 <b>КАК ПОЛУЧАТЬ XP</b>\n\n"
+        "• Обычное сообщение: <code>+5 XP</code>\n"
+        "• Длинное сообщение (50+ символов): <code>+10 XP</code> сверху\n"
+        "• Оживление чата после долгой паузы: <code>+50 XP</code>\n"
+        "• Фото/видео (раз в 10 минут): <code>+15 XP</code>\n"
+        "• Ночная активность (02:00-07:00): множитель <code>x1.5</code>\n"
+        "• Получение репутации от игрока уровня 4+: <code>+150 XP</code>\n"
+        "• Бесплатный кубик (раз в 12 часов): шанс <code>+50 XP</code>\n\n"
+        "XP может как повышать, так и понижать уровень в играх и дуэлях."
+    )
+
 # --- КОМАНДЫ ---
 
 # ИЗМЕНЕНО: Добавлен фильтр F.chat.type == "private", чтобы работало только в ЛС
 @router.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: types.Message):
-    # delete_later убран, так как в ЛС бот не может удалять сообщения пользователя
-    await message.answer_photo(
+    await answer_temp(
+        message,
         photo=IMG_WELCOME,
-        caption=(
+        text=(
             f"👋 <b>Я бот-модератор для чата.</b>\n"
             f"<i>Чтобы посмотреть мои команды, напиши</i> <code>/help</code>."
-        )
+        ),
+        parse_mode="HTML",
     )
 
 @router.message(Command("help"))
@@ -88,31 +136,66 @@ async def cmd_help(message: types.Message):
     
     user_data = await get_user(message.from_user.id)
     lvl = user_data[4]
-
-    text = (
-        "📚 <b>УРОВНИ</b>\n\n"
-        "<b>Уровень 1:</b>\n"
-        "Новички — доступен только чат.\n\n"
-        "<b>Уровень 2:</b>\n"
-        "• <code>/profile</code> — Просмотр профиля\n"
-        "• <code>/leaders</code> — Список лидеров\n\n"
-        "<b>Уровень 3:</b>\n"
-        "• <code>/games</code> — Меню аркад\n"
-        "• <code>/duel @user</code> — Вызвать на дуэль\n"
-        "• <code>/staff</code> — Состав персонала\n\n"
-        "<b>Уровень 4:</b>\n"
-        "• Ответь <code>+rep</code> — Повысить репутацию\n"
-        "• <code>/profile @username</code> — Просмотр чужих профилей\n\n"
-        "<b>Уровень 5:</b>\n"
-        "• Ответь <code>/wipe</code> — Удалить сообщение (1 раз в день)\n\n"
-        f"Ваш уровень: <b>{lvl}</b>"
+    text = help_main_text(lvl)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💡 Как получать XP", callback_data="help_xp")]
+        ]
     )
 
-    await message.answer_photo(
+    await answer_temp(
+        message,
+        text=text,
         photo=IMG_HELP_LEADERS,
-        caption=text,
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=kb,
+        global_key="help_menu",
     )
+
+
+@router.callback_query(F.data == "help_xp")
+async def cb_help_xp(callback: CallbackQuery):
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="help_back")]
+        ]
+    )
+    await answer_temp(
+        callback.message,
+        text=help_xp_text(),
+        photo=IMG_HELP_LEADERS,
+        parse_mode="HTML",
+        reply_markup=kb,
+        global_key="help_menu",
+    )
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == "help_back")
+async def cb_help_back(callback: CallbackQuery):
+    user_data = await get_user(callback.from_user.id)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💡 Как получать XP", callback_data="help_xp")]
+        ]
+    )
+    await answer_temp(
+        callback.message,
+        text=help_main_text(user_data[4]),
+        photo=IMG_HELP_LEADERS,
+        parse_mode="HTML",
+        reply_markup=kb,
+        global_key="help_menu",
+    )
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.answer()
 
 @router.message(Command("staff"))
 async def cmd_staff(message: types.Message):
@@ -123,11 +206,11 @@ async def cmd_staff(message: types.Message):
     
     eff_lvl = await get_effective_level(message.from_user.id, message.chat, lvl)
     if eff_lvl < 3:
-        return await answer_temp(message, "🔒 Команда <code>/staff</code> доступна с <b>3 уровня</b>.", delay=5)
+        return await answer_temp(message, "🔒 Команда <code>/staff</code> доступна с <b>3 уровня</b>.")
 
     staff_list = await get_all_staff()
     if not staff_list:
-        return await answer_temp(message, "Список персонала пуст.", delay=10)
+        return await answer_temp(message, "Список персонала пуст.")
     
     # Новые названия ролей
     roles = {
@@ -179,7 +262,7 @@ async def cmd_staff(message: types.Message):
     
     full_text = "\n".join(text_lines) + "\n" + "_"*15 + "\n\n" + text_commands
             
-    await answer_temp(message, full_text, delay=60)
+    await answer_temp(message, full_text)
 
 @router.message(Command("leaders"))
 async def cmd_leaders(message: types.Message):
@@ -190,14 +273,16 @@ async def cmd_leaders(message: types.Message):
     
     eff_lvl = await get_effective_level(message.from_user.id, message.chat, lvl)
     if eff_lvl < 2:
-        return await answer_temp(message, "🔒 Список лидеров доступен со <b>2 уровня</b>.", delay=5)
+        return await answer_temp(message, "🔒 Список лидеров доступен со <b>2 уровня</b>.")
     
     text = await generate_leaders_text(message.from_user.id)
     
-    await message.answer_photo(
+    await answer_temp(
+        message,
+        text=text,
         photo=IMG_HELP_LEADERS,
-        caption=text,
-        parse_mode="HTML"
+        parse_mode="HTML",
+        global_key="leaders_message",
     )
 
 async def generate_leaders_text(user_id):
@@ -220,35 +305,30 @@ async def generate_leaders_text(user_id):
     return text
 
 @router.message(Command("profile"))
-async def show_profile(message: types.Message, command: CommandObject):
+async def show_profile(message: types.Message, command: CommandObject = None):
     await delete_later(message, 0)
     user_id = message.from_user.id
-
-    if user_id in profile_messages:
-        try:
-            await message.bot.delete_message(chat_id=message.chat.id, message_id=profile_messages[user_id])
-        except Exception:
-            pass
 
     caller_data = await get_user(
         user_id=message.from_user.id, 
         username=message.from_user.username, 
         full_name=message.from_user.full_name
     )
-    db_level = caller_data[6] if caller_data and len(caller_data) > 6 else 0
-    lvl = caller_data[4]
+    db_level = caller_data[6] if caller_data and len(caller_data) > 6 and caller_data[6] is not None else 0
+    lvl = caller_data[4] if caller_data and len(caller_data) > 4 and caller_data[4] is not None else 1
     
     effective_level = await get_effective_level(message.from_user.id, message.chat, db_level)
 
     target_id = None
-    is_foreign_request = (command.args is not None and command.args.strip()) or message.reply_to_message
+    cmd_args = command.args if command else None
+    is_foreign_request = (cmd_args is not None and cmd_args.strip()) or message.reply_to_message
 
     if is_foreign_request:
         if effective_level < 4 and lvl < 4:
             return await answer_temp(message, "⛔ Просмотр чужих профилей доступен с <b>4 уровня</b>.")
         
-        if command.args:
-            username_arg = command.args.split()[0].replace("@", "")
+        if cmd_args:
+            username_arg = cmd_args.split()[0].replace("@", "")
             found_id = await get_id_by_username(username_arg)
             if found_id: target_id = found_id
             else: return await answer_temp(message, "❌ Пользователь не найден.")
@@ -259,31 +339,25 @@ async def show_profile(message: types.Message, command: CommandObject):
     
     if not target_id: return
 
-    text, photo = await generate_profile_content(target_id)
+    text, photo, free_dice_ready = await generate_profile_content(target_id)
     
     markup = None
     if target_id == message.from_user.id:
         final_lvl = effective_level if effective_level > lvl else lvl
-        markup = get_profile_keyboard(final_lvl)
+        markup = get_profile_keyboard(final_lvl, free_dice_ready=free_dice_ready, owner_id=message.from_user.id)
 
-    try:
-        if photo:
-            msg = await message.answer_photo(photo=photo, caption=text, parse_mode="HTML", reply_markup=markup)
-        else:
-            msg = await message.answer(text, parse_mode="HTML", reply_markup=markup)
-        
-        profile_messages[user_id] = msg.message_id
-        await delete_later(msg, 60)
-        
-    except Exception as e:
-        await answer_temp(message, f"Ошибка: {e}")
+    sent = await answer_temp(message, text=text, photo=photo, parse_mode="HTML", reply_markup=markup)
+    if sent is None and photo is not None:
+        # Fallback: if external image URL is unavailable, send text-only profile.
+        await answer_temp(message, text=text, parse_mode="HTML", reply_markup=markup)
 
 
 async def generate_profile_content(user_id):
     data = await get_user(user_id)
-    if not data: return "Нет данных.", None
+    if not data:
+        return "Нет данных.", None, False
     
-    _, _, db_full_name, xp, lvl, warns, mod_lvl, rep = data
+    _, _, db_full_name, xp, lvl, warns, mod_lvl, rep, _last_free_dice_ts = data
     
     role_map = {
         1: "Moder¹",
@@ -337,36 +411,52 @@ async def generate_profile_content(user_id):
         f"{xp_line}"
         f"{warn_text}" 
     )
+
+    remaining = await get_free_dice_remaining(user_id)
+    if remaining <= 0:
+        profile_text += "\n\n🎁 <b>Доступен бесплатный бросок кубика</b>"
+        free_dice_ready = True
+    else:
+        profile_text += f"\n\n⏳ Бросок кубика будет доступен через <b>{format_dice_cooldown(remaining)}</b>"
+        free_dice_ready = False
     
     photo = None
-    if lvl >= 3:
-        if lvl == 3: photo = IMG_LEVEL_3
-        elif lvl == 4: photo = IMG_LEVEL_4
-        else: photo = IMG_LEVEL_5
+    if lvl == 1:
+        photo = IMG_LEVEL_1
+    elif lvl == 2:
+        photo = IMG_LEVEL_2
+    elif lvl == 3:
+        photo = IMG_LEVEL_3
+    elif lvl == 4:
+        photo = IMG_LEVEL_4
+    else:
+        photo = IMG_LEVEL_5
         
-    return profile_text, photo
+    return profile_text, photo, free_dice_ready
 
-def get_profile_keyboard(user_lvl):
+def get_profile_keyboard(user_lvl, free_dice_ready=False, owner_id=None):
     if user_lvl >= 2:
         btn_leaders = InlineKeyboardButton(text="🏆 Лидеры", callback_data="nav_leaders")
     else:
         btn_leaders = InlineKeyboardButton(text="🔒 Лидеры (Ур.2)", callback_data="locked_2")
         
-    if user_lvl >= 3:
+    if user_lvl >= 1:
         btn_games = InlineKeyboardButton(text="🎮 Игры", callback_data="nav_games")
     else:
-        btn_games = InlineKeyboardButton(text="🔒 Игры (Ур.3)", callback_data="locked_3")
+        btn_games = InlineKeyboardButton(text="🔒 Игры (Ур.1)", callback_data="locked_1")
         
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [btn_leaders, btn_games]
-    ])
+    rows = [[btn_leaders, btn_games]]
+    if free_dice_ready and owner_id is not None:
+        rows.append([InlineKeyboardButton(text="🎁 Бросить бесплатный кубик", callback_data=f"free_dice_roll:{owner_id}")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     return kb
 
 # --- CALLBACK HANDLERS (МЕНЮ ПРОФИЛЯ) ---
 
 @router.callback_query(F.data == "nav_profile")
 async def cb_back_profile(callback: CallbackQuery):
-    text, _ = await generate_profile_content(callback.from_user.id)
+    text, _, free_dice_ready = await generate_profile_content(callback.from_user.id)
     
     caller_data = await get_user(callback.from_user.id)
     lvl = caller_data[4]
@@ -375,12 +465,25 @@ async def cb_back_profile(callback: CallbackQuery):
     eff_lvl = await get_effective_level(callback.from_user.id, callback.message.chat, db_level)
     final_lvl = eff_lvl if eff_lvl > lvl else lvl
     
-    markup = get_profile_keyboard(final_lvl)
+    markup = get_profile_keyboard(final_lvl, free_dice_ready=free_dice_ready, owner_id=callback.from_user.id)
     
-    if callback.message.photo:
-        await callback.message.edit_caption(caption=text, parse_mode="HTML", reply_markup=markup)
-    else:
-        await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=markup)
+    try:
+        if callback.message.photo:
+            await callback.message.edit_caption(caption=text, parse_mode="HTML", reply_markup=markup)
+        else:
+            await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        await answer_temp(
+            callback.message,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=markup,
+            user_id=callback.from_user.id,
+        )
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
     await callback.answer()
 
 @router.callback_query(F.data == "nav_leaders")
@@ -408,7 +511,14 @@ async def cb_leaders(callback: CallbackQuery):
                 reply_markup=kb
             )
         else:
-            await callback.message.answer_photo(photo=IMG_HELP_LEADERS, caption=text, parse_mode="HTML", reply_markup=kb)
+            await answer_temp(
+                callback.message,
+                text=text,
+                photo=IMG_HELP_LEADERS,
+                parse_mode="HTML",
+                reply_markup=kb,
+                user_id=callback.from_user.id,
+            )
             await callback.message.delete()
     except Exception:
         if callback.message.photo:
@@ -424,8 +534,8 @@ async def cb_games(callback: CallbackQuery):
     
     eff_lvl = await get_effective_level(callback.from_user.id, callback.message.chat, db_level)
     
-    if eff_lvl < 3 and lvl < 3:
-        return await callback.answer("Нужен уровень 3!", show_alert=True)
+    if eff_lvl < 1 and lvl < 1:
+        return await callback.answer("Нужен уровень 1!", show_alert=True)
     
     uid = callback.from_user.id
     final_lvl = eff_lvl if eff_lvl > lvl else lvl
@@ -433,20 +543,23 @@ async def cb_games(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             get_game_btn_simple('dice', final_lvl, "🎲 Кости", "game_menu_dice", uid),
-            get_game_btn_simple('slots', final_lvl, "🎰 Слоты", "game_menu_slots", uid)
+            get_game_btn_simple('slots', final_lvl, "🎰 Рулетка", "game_menu_slots", uid)
         ],
         [
-            get_game_btn_simple('basketball', final_lvl, "🏀 Баскет", "game_menu_basket", uid),
-            get_game_btn_simple('duel', final_lvl, "🔫 Дуэль", "game_info_duel", uid)
+            get_game_btn_simple('duel', final_lvl, "🔫 Дуэль", "game_info_duel", uid),
+            get_game_btn_simple('basketball', final_lvl, "🏀 Баскет", "game_menu_basket", uid)
         ],
-        [InlineKeyboardButton(text="🔙 В профиль", callback_data="nav_profile")]
+        [InlineKeyboardButton(text="👤 В профиль", callback_data="nav_profile")]
     ])
     
     text = (
-        f"🕹️<b>Список игр</b>\n\n"
-        f"👤 Пользователь: <b>{callback.from_user.full_name}</b>\n"
-        f"💳 Баланс: <code>{format_xp(user_data[3])} XP</code>\n\n"
-        f"Выбрать игру:"
+        f"🕹️ <b>ИГРОВАЯ ЗОНА</b>\n"
+        f"👤 Игрок: <b>{callback.from_user.full_name}</b>\n"
+        f"\n"
+        f"📊 Уровень: <b>{final_lvl}</b>\n"
+        f"💳 Баланс: <code>{format_xp(user_data[3])} XP</code>\n"
+        f"\n"
+        f"Выберите автомат:"
     )
 
     if callback.message.photo:
@@ -455,7 +568,79 @@ async def cb_games(callback: CallbackQuery):
         await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=kb)
     await callback.answer()
 
-@router.callback_query(F.data.startswith("locked_"))
+
+@router.callback_query(F.data.startswith("free_dice_roll:"))
+async def cb_free_dice_roll(callback: CallbackQuery):
+    owner_id = int(callback.data.split(":", 1)[1])
+    if callback.from_user.id != owner_id:
+        return await callback.answer("Этот бросок не для вас.", show_alert=True)
+
+    user_id = callback.from_user.id
+    remaining = await get_free_dice_remaining(user_id)
+    if remaining > 0:
+        return await callback.answer(
+            f"Кубик будет доступен через {format_dice_cooldown(remaining)}.",
+            show_alert=True,
+        )
+
+    claimed = await claim_free_dice(user_id)
+    if not claimed:
+        remaining = await get_free_dice_remaining(user_id)
+        return await callback.answer(
+            f"Кубик будет доступен через {format_dice_cooldown(remaining)}.",
+            show_alert=True,
+        )
+
+    dice_msg = await callback.message.answer_dice(emoji="🎲")
+    await asyncio.sleep(4)
+    value = dice_msg.dice.value
+
+    if value >= 4:
+        await update_xp(user_id, 50)
+        result_text = f"🎉 <b>Бесплатный бросок: {value}</b>\nВыигрыш: <code>+50 XP</code>!"
+    else:
+        result_text = f"🎲 <b>Бесплатный бросок: {value}</b>\nНа этот раз без награды."
+
+    text, _, free_dice_ready = await generate_profile_content(user_id)
+
+    user_data = await get_user(user_id)
+    lvl = user_data[4]
+    db_level = user_data[6]
+    eff_lvl = await get_effective_level(user_id, callback.message.chat, db_level)
+    final_lvl = eff_lvl if eff_lvl > lvl else lvl
+    markup = get_profile_keyboard(final_lvl, free_dice_ready=free_dice_ready, owner_id=user_id)
+
+    try:
+        if callback.message.photo:
+            await callback.message.edit_caption(caption=text, parse_mode="HTML", reply_markup=markup)
+        else:
+            await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=markup)
+    except Exception:
+        # Fallback: if profile edit fails, send profile as a fresh message.
+        await answer_temp(
+            callback.message,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=markup,
+            user_id=user_id,
+        )
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+    # Separate message with game result (not embedded into profile).
+    await answer_temp(
+        callback.message,
+        text=result_text,
+        parse_mode="HTML",
+        key=f"free_dice_result:{user_id}",
+    )
+
+    await delete_later(dice_msg, 4)
+    await callback.answer("Бросок выполнен!")
+
+@router.callback_query(F.data.startswith("locked_") & ~F.data.startswith("locked_game"))
 async def cb_locked(callback: CallbackQuery):
     req_lvl = callback.data.split("_")[1]
     await callback.answer(f"🔒 Этот раздел доступен с {req_lvl} уровня!", show_alert=True)
@@ -492,7 +677,7 @@ async def cmd_wipe(message: types.Message):
     try:
         await message.reply_to_message.delete()
         await delete_later(message, 0)
-        await message.answer(f"🗑 <b>Народный модератор {message.from_user.mention_html()} удалил сообщение!</b>")
+        await answer_temp(message, f"🗑 <b>Народный модератор {message.from_user.mention_html()} удалил сообщение!</b>")
     except Exception as e:
         await answer_temp(message, f"❌ Не удалось удалить: {e}")
 
@@ -505,14 +690,6 @@ async def on_user_join(message: types.Message):
     except Exception:
         pass
 
-    chat_id = message.chat.id
-    if chat_id in last_welcome_messages:
-        old_message_id = last_welcome_messages[chat_id]
-        try:
-            await message.bot.delete_message(chat_id=chat_id, message_id=old_message_id)
-        except Exception:
-            pass
-
     new_user = message.new_chat_members[0]
     welcome_text = (
         f"🧩 Привет, {new_user.mention_html()}!\n\n"
@@ -523,13 +700,13 @@ async def on_user_join(message: types.Message):
     )
 
     try:
-        sent_message = await message.answer_photo(
+        await answer_temp(
+            message,
+            text=welcome_text,
             photo=IMG_WELCOME,
-            caption=welcome_text,
-            parse_mode="HTML"
+            parse_mode="HTML",
+            global_key="welcome_message",
         )
-        last_welcome_messages[chat_id] = sent_message.message_id
-        await delete_later(sent_message, 600)
     except Exception as e:
         print(f"Ошибка при отправке приветствия: {e}")
 
@@ -565,7 +742,8 @@ async def text_handler(message: types.Message):
             
             if result == "success":
                 old, new, added = await update_xp(target_id, 150)
-                await message.answer(
+                await answer_temp(
+                    message,
                     f"🤝 {message.from_user.mention_html()} повысил репутацию {message.reply_to_message.from_user.mention_html()}!\n"
                     f"Получено <code>+150 XP</code>."
                 )
@@ -596,7 +774,7 @@ async def text_handler(message: types.Message):
     if now - chat_last > 3600:
         earned_xp += 50
         # ИЗМЕНЕНО: БОНУС НЕКРОМАНТА -> Бонус за оживление чата
-        await message.reply("⚡ <b>Бонус за оживление чата!</b>\n<code>+50 XP</code>!")
+        await answer_temp(message, "⚡ <b>Бонус за оживление чата!</b>\n<code>+50 XP</code>!", reply=True)
     
     chat_last_active[message.chat.id] = now
     
@@ -609,14 +787,18 @@ async def text_handler(message: types.Message):
     
     # ИЗМЕНЕНО: LEVEL UP/DOWN -> Уровень повышен/понижен
     if new_lvl > old_lvl:
-        await message.reply(
+        await answer_temp(
+            message,
             f"🆙 <b>Уровень повышен до {new_lvl}!</b>\n"
-            f"{message.from_user.mention_html()} достиг новых высот!"
+            f"{message.from_user.mention_html()} достиг новых высот!",
+            reply=True,
         )
     elif new_lvl < old_lvl:
-        await message.reply(
+        await answer_temp(
+            message,
             f"📉 <b>Уровень понижен до {new_lvl}...</b>\n"
-            f"{message.from_user.mention_html()} потерял позиции."
+            f"{message.from_user.mention_html()} потерял позиции.",
+            reply=True,
         )
 
 # --- ХЕНДЛЕР КОНТЕНТА (Видео/Фото) ---
@@ -643,4 +825,4 @@ async def media_handler(message: types.Message):
         
         # ИЗМЕНЕНО: LEVEL UP
         if new_lvl > old_lvl:
-            await message.reply(f"🆙 <b>Уровень повышен до {new_lvl}! (Контент-мейкер)</b>")
+            await answer_temp(message, f"🆙 <b>Уровень повышен до {new_lvl}! (Контент-мейкер)</b>", reply=True)
