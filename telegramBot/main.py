@@ -9,10 +9,10 @@ from aiogram.types import BotCommandScopeDefault
 from config import BOT_TOKEN, COMMANDS
 from database import create_tables, DB_NAME
 
-# РРјРїРѕСЂС‚ РјРѕРґСѓР»РµР№
+# Импорт модулей
 from modules import admin, moderation, user, games 
 
-# !!! РРњРџРћР Рў Р¤РЈРќРљР¦РР Р”Р›РЇ RENDER !!!
+# Импорт функции для Render
 from keep_alive import keep_alive 
 
 async def main():
@@ -22,7 +22,7 @@ async def main():
     if os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"):
         keep_alive()
 
-    # РРЅРёС†РёР°Р»РёР·Р°С†РёСЏ Р‘Р”
+    # Инициализация БД
     await create_tables()
     print(f"DB path: {DB_NAME}")
     
@@ -32,7 +32,7 @@ async def main():
     )
     dp = Dispatcher()
 
-    # Р РµРіРёСЃС‚СЂР°С†РёСЏ СЂРѕСѓС‚РµСЂРѕРІ
+    # Регистрация роутеров
     dp.include_router(admin.router)
     dp.include_router(moderation.router)
     dp.include_router(user.router)
@@ -40,7 +40,7 @@ async def main():
 
     await bot.set_my_commands(COMMANDS, scope=BotCommandScopeDefault())
 
-    print("рџљЂ Р‘РѕС‚ Р·Р°РїСѓС‰РµРЅ! РЎРёСЃС‚РµРјР° СѓСЂРѕРІРЅРµР№ 2.0 Р°РєС‚РёРІРёСЂРѕРІР°РЅР°.")
+    print("Бот запущен. Система уровней 2.0 активирована.")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
@@ -48,4 +48,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Р‘РѕС‚ РѕСЃС‚Р°РЅРѕРІР»РµРЅ")
+        print("Бот остановлен")

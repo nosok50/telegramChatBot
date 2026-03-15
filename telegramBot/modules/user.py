@@ -7,9 +7,17 @@ from database import (
     LEVEL_CAPS, give_reputation, check_wipe_cooldown,
     get_top_users, get_user_rank, get_all_staff,
     get_free_dice_remaining, claim_free_dice,
+    register_sync_activity,
 )
 from config import WARN_LIMIT, OWNER_ID
-from utils import delete_later, answer_temp, get_user_link
+from utils import (
+    delete_later,
+    answer_temp,
+    get_user_link,
+    bump_sticky_message_counter,
+    replace_sticky_message,
+    is_anonymous_admin_message,
+)
 import time
 import asyncio
 from datetime import datetime
@@ -32,7 +40,7 @@ IMG_WELCOME = "https://i.ibb.co/Q3GG72fN/Frame-26085986.png"
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
-async def get_effective_level(user_id: int, chat: types.Chat, db_level: int):
+async def get_effective_level(user_id: int, chat: types.Chat, db_level: int, sender_chat: types.Chat = None):
     """
     Определяет эффективный уровень (учитывая права админа).
     """
@@ -40,6 +48,9 @@ async def get_effective_level(user_id: int, chat: types.Chat, db_level: int):
     
     # 1. Проверка глобальных ID (Владелец, Аноним, Telegram)
     if user_id in [OWNER_ID, 1087968824, 777000]:
+        return 5
+
+    if sender_chat and sender_chat.id == chat.id:
         return 5
         
     # 2. Проверка админки в текущем чате
@@ -85,11 +96,11 @@ def help_main_text(user_level: int) -> str:
         "<b>Уровень 1:</b>\n"
         "• <code>/profile</code> — ваш профиль\n"
         "• <code>/games</code> — доступ к игровой зоне\n"
+        "• <code>/factory</code> — быстрый вход в управление цехом\n"
         "• 🎲 Кости\n\n"
         "<b>Уровень 2:</b>\n"
         "• <code>/leaders</code> — топ игроков\n"
-        "• 🎰 Рулетка\n"
-        "• 🔫 Дуэль\n\n"
+        "• 🎰 Рулетка\n\n"
         "<b>Уровень 3:</b>\n"
         "• 🏀 Баскетбол\n"
         "• <code>/staff</code> — состав персонала\n\n"
@@ -204,7 +215,7 @@ async def cmd_staff(message: types.Message):
     user_data = await get_user(message.from_user.id)
     lvl = user_data[4]
     
-    eff_lvl = await get_effective_level(message.from_user.id, message.chat, lvl)
+    eff_lvl = await get_effective_level(message.from_user.id, message.chat, lvl, message.sender_chat)
     if eff_lvl < 3:
         return await answer_temp(message, "🔒 Команда <code>/staff</code> доступна с <b>3 уровня</b>.")
 
@@ -271,7 +282,7 @@ async def cmd_leaders(message: types.Message):
     user_data = await get_user(message.from_user.id)
     lvl = user_data[4]
     
-    eff_lvl = await get_effective_level(message.from_user.id, message.chat, lvl)
+    eff_lvl = await get_effective_level(message.from_user.id, message.chat, lvl, message.sender_chat)
     if eff_lvl < 2:
         return await answer_temp(message, "🔒 Список лидеров доступен со <b>2 уровня</b>.")
     
@@ -317,7 +328,7 @@ async def show_profile(message: types.Message, command: CommandObject = None):
     db_level = caller_data[6] if caller_data and len(caller_data) > 6 and caller_data[6] is not None else 0
     lvl = caller_data[4] if caller_data and len(caller_data) > 4 and caller_data[4] is not None else 1
     
-    effective_level = await get_effective_level(message.from_user.id, message.chat, db_level)
+    effective_level = await get_effective_level(message.from_user.id, message.chat, db_level, message.sender_chat)
 
     target_id = None
     cmd_args = command.args if command else None
@@ -446,6 +457,8 @@ def get_profile_keyboard(user_lvl, free_dice_ready=False, owner_id=None):
         btn_games = InlineKeyboardButton(text="🔒 Игры (Ур.1)", callback_data="locked_1")
         
     rows = [[btn_leaders, btn_games]]
+    if owner_id is not None:
+        rows.append([InlineKeyboardButton(text="🏭 Управление цехом", callback_data=f"farm_open:{owner_id}")])
     if free_dice_ready and owner_id is not None:
         rows.append([InlineKeyboardButton(text="🎁 Бросить бесплатный кубик", callback_data=f"free_dice_roll:{owner_id}")])
 
@@ -549,12 +562,13 @@ async def cb_games(callback: CallbackQuery):
             get_game_btn_simple('duel', final_lvl, "🔫 Дуэль", "game_info_duel", uid),
             get_game_btn_simple('basketball', final_lvl, "🏀 Баскет", "game_menu_basket", uid)
         ],
+        [InlineKeyboardButton(text="🏭 Управление цехом", callback_data=f"farm_open:{uid}")],
         [InlineKeyboardButton(text="👤 В профиль", callback_data="nav_profile")]
     ])
     
+    user_link = get_user_link(uid, callback.from_user.full_name or "Игрок")
     text = (
-        f"🕹️ <b>ИГРОВАЯ ЗОНА</b>\n"
-        f"👤 Игрок: <b>{callback.from_user.full_name}</b>\n"
+        f"🕹️ <b>Игровая зона</b> • {user_link}\n"
         f"\n"
         f"📊 Уровень: <b>{final_lvl}</b>\n"
         f"💳 Баланс: <code>{format_xp(user_data[3])} XP</code>\n"
@@ -656,7 +670,9 @@ async def cmd_wipe(message: types.Message):
     mod_lvl = user_data[6]
     
     is_chat_admin = False
-    if message.from_user.id == OWNER_ID or mod_lvl >= 5:
+    if is_anonymous_admin_message(message):
+        is_chat_admin = True
+    elif message.from_user.id == OWNER_ID or mod_lvl >= 5:
         is_chat_admin = True
     elif message.chat.type != 'private':
         try:
@@ -715,6 +731,12 @@ async def on_user_join(message: types.Message):
 @router.message(F.text & ~F.text.startswith('/'))
 async def text_handler(message: types.Message):
     if message.chat.type == 'private': return
+
+    await register_sync_activity()
+    bump_sticky_message_counter(message.chat.id, "games_menu_hint")
+
+    if not message.from_user:
+        return
     
     user_id = message.from_user.id
     now = time.time()
@@ -729,6 +751,8 @@ async def text_handler(message: types.Message):
         is_admin_or_staff = False
         if giver_mod_lvl >= 1 or user_id == OWNER_ID:
              is_admin_or_staff = True
+        elif is_anonymous_admin_message(message):
+            is_admin_or_staff = True
         elif message.chat.type != 'private':
             try:
                 member = await message.chat.get_member(user_id)
@@ -773,8 +797,16 @@ async def text_handler(message: types.Message):
     chat_last = chat_last_active.get(message.chat.id, now)
     if now - chat_last > 3600:
         earned_xp += 50
-        # ИЗМЕНЕНО: БОНУС НЕКРОМАНТА -> Бонус за оживление чата
-        await answer_temp(message, "⚡ <b>Бонус за оживление чата!</b>\n<code>+50 XP</code>!", reply=True)
+        await replace_sticky_message(
+            message,
+            scope="chat_revived_notice",
+            text=(
+                f"⚡ <b>Чат оживлён</b>\n"
+                f"{message.from_user.mention_html()} получает <code>+50 XP</code> за новую волну активности."
+            ),
+            reply=True,
+            parse_mode="HTML",
+        )
     
     chat_last_active[message.chat.id] = now
     
@@ -805,6 +837,12 @@ async def text_handler(message: types.Message):
 @router.message(F.photo | F.video)
 async def media_handler(message: types.Message):
     if message.chat.type == 'private': return
+
+    await register_sync_activity()
+    bump_sticky_message_counter(message.chat.id, "games_menu_hint")
+
+    if not message.from_user:
+        return
     
     user_id = message.from_user.id
     now = time.time()

@@ -1,9 +1,11 @@
 ﻿# -*- coding: utf-8 -*-
 import math
+import os
+import time
 from datetime import datetime
 from aiogram import Router, F, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from database import (
@@ -15,6 +17,8 @@ from database import (
     get_db_sync_status,
     trigger_manual_sync,
     get_user,
+    import_local_db_from_file,
+    DB_NAME,
 )
 from config import OWNER_ID
 from utils import answer_temp, delete_later
@@ -26,6 +30,7 @@ class AdminStates(StatesGroup):
     waiting_del_wl = State()
     waiting_add_bw = State()
     waiting_del_bw = State()
+    waiting_db_import_file = State()
 
 
 async def can_view_db_status_user(chat: types.Chat, user_id: int) -> bool:
@@ -61,6 +66,7 @@ def main_admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Белый список", callback_data="nav_whitelist"),
          InlineKeyboardButton(text="🤬 Фильтр слов", callback_data="nav_badwords")],
+        [InlineKeyboardButton(text="🗄 DB статус", callback_data="nav_db_status")],
         [InlineKeyboardButton(text="❌ Закрыть панель", callback_data="close_admin")]
     ])
 
@@ -370,12 +376,7 @@ async def admin_reset(message: types.Message):
     await answer_temp(message, f"✅ Предупреждения для <b>{target_name}</b> полностью сброшены.")
 
 
-@router.message(Command("dbstatus"))
-async def db_status(message: types.Message):
-    await delete_later(message, 0)
-    if not await can_view_db_status(message):
-        return
-
+async def build_db_status_view(include_back: bool = False):
     status = await get_db_sync_status()
     last_sync = status["last_sync_at"]
     last_sync_str = datetime.fromtimestamp(last_sync).strftime("%Y-%m-%d %H:%M:%S") if last_sync else "никогда"
@@ -385,26 +386,53 @@ async def db_status(message: types.Message):
 
     text = (
         "🗄 <b>Статус БД</b>\n\n"
-        f"• <b>Локальная БД (файл):</b>\n<code>{status['db_path']}</code>\n"
+        f"• <b>Локальная БД:</b>\n<code>{status['db_path']}</code>\n"
         f"• <b>Neon настроен:</b> <code>{status['neon_configured']}</code>\n"
         f"• <b>Neon сейчас подключен:</b> <code>{status['neon_connected']}</code>\n"
+        f"• <b>Событийный sync-цикл активен:</b> <code>{status['sync_loop_running']}</code>\n"
         f"• <b>Таблицы с несинхронизированными изменениями:</b>\n<code>{dirty}</code>\n"
-        f"• <b>Счетчик локальных изменений с прошлого sync:</b> <code>{status['local_change_count']}</code>\n"
+        f"• <b>Локальных изменений с прошлого sync:</b> <code>{status['local_change_count']}</code>\n"
+        f"• <b>Сообщений-активностей с прошлого sync:</b> <code>{status['activity_message_count']}</code>\n"
         f"• <b>Последняя успешная синхронизация:</b> <code>{last_sync_str}</code>\n"
-        f"• <b>Следующая попытка синхронизации не раньше:</b> <code>{next_try_str}</code>\n\n"
-        f"⚙️ <b>Пороговые параметры синка</b>\n"
-        f"• Проверка условий синка: <code>только при новых записях</code>, но не чаще <code>{status['sync_check_interval']}s</code>\n"
+        f"• <b>Следующая попытка не раньше:</b> <code>{next_try_str}</code>\n\n"
+        "⚙️ <b>Условия синхронизации</b>\n"
+        "• Повод проверки: <code>новые сообщения пользователей</code>\n"
+        f"• Минимум сообщений до sync: <code>{status['sync_min_activity_messages']}</code>\n"
         f"• Минимальный интервал между sync: <code>{status['sync_min_interval']}s</code>\n"
-        f"• Интервал retry при ошибке Neon: <code>{status['sync_retry_interval']}s</code>\n"
-        f"• Минимум накопленных изменений для штатного sync: <code>{status['sync_min_local_changes']}</code>\n"
-        f"• Форс-sync при долгом долге: <code>{status['sync_max_dirty_age']}s</code>\n\n"
+        f"• Интервал retry после ошибки Neon: <code>{status['sync_retry_interval']}s</code>\n"
+        f"• Локальная задержка проверки условий: <code>{status['sync_check_interval']}s</code>\n\n"
         f"📩 <b>Кому идут DB-уведомления:</b> <code>{status['alert_user_id']}</code>\n"
         f"• <b>Последняя ошибка Neon:</b> <code>{status['last_neon_error'] or 'нет'}</code>"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Запулить сейчас", callback_data="db_sync_now")]
-    ])
-    await answer_temp(message, text, reply_markup=kb)
+
+    kb_rows = [
+        [InlineKeyboardButton(text="🔄 Синхронизировать сейчас", callback_data="db_sync_now")],
+        [InlineKeyboardButton(text="📤 Отправить backup owner", callback_data="db_send_backup")],
+        [InlineKeyboardButton(text="📥 Загрузить DB из файла", callback_data="db_import_prompt")],
+    ]
+    if include_back:
+        kb_rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="nav_main")])
+    return text, InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+
+@router.callback_query(F.data == "nav_db_status")
+async def nav_db_status(clb: CallbackQuery):
+    if not await can_view_db_status_user(clb.message.chat, clb.from_user.id):
+        await clb.answer("Недостаточно прав.", show_alert=True)
+        return
+    text, kb = await build_db_status_view(include_back=True)
+    await clb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await clb.answer()
+
+
+@router.message(Command("dbstatus"))
+async def db_status(message: types.Message):
+    await delete_later(message, 0)
+    if not await can_view_db_status(message):
+        return
+
+    text, kb = await build_db_status_view()
+    await answer_temp(message, text, reply_markup=kb, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "db_sync_now")
@@ -420,3 +448,89 @@ async def db_sync_now(clb: CallbackQuery):
         f"🧩 <b>Ручной sync</b>\n{res['message']}",
         user_id=clb.from_user.id,
     )
+
+
+@router.callback_query(F.data == "db_send_backup")
+async def db_send_backup(clb: CallbackQuery):
+    if not await can_view_db_status_user(clb.message.chat, clb.from_user.id):
+        await clb.answer("Недостаточно прав.", show_alert=True)
+        return
+    if not os.path.exists(DB_NAME):
+        await clb.answer("Локальный файл БД не найден.", show_alert=True)
+        return
+
+    try:
+        caption = f"[DB] Backup SQLite ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+        await clb.bot.send_document(
+            chat_id=OWNER_ID,
+            document=FSInputFile(DB_NAME),
+            caption=caption,
+        )
+        await clb.answer("Backup отправлен владельцу.", show_alert=True)
+    except Exception as e:
+        await clb.answer("Не удалось отправить backup.", show_alert=True)
+        await answer_temp(clb.message, f"Ошибка отправки backup: <code>{e}</code>", user_id=clb.from_user.id)
+
+
+@router.callback_query(F.data == "db_import_prompt")
+async def db_import_prompt(clb: CallbackQuery, state: FSMContext):
+    if not await can_view_db_status_user(clb.message.chat, clb.from_user.id):
+        await clb.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_db_import_file)
+    await answer_temp(
+        clb.message,
+        "📥 <b>Импорт локальной БД</b>\n"
+        "Отправьте SQLite-файл <code>.db</code> документом в этот чат.\n"
+        "После импорта бот сразу попробует синхронизировать данные в Neon.",
+        user_id=clb.from_user.id,
+    )
+    await clb.answer()
+
+
+@router.message(AdminStates.waiting_db_import_file)
+async def db_import_receive_file(message: types.Message, state: FSMContext):
+    await delete_later(message, 0)
+
+    if not await can_view_db_status(message):
+        await state.clear()
+        return
+
+    doc = message.document
+    if not doc:
+        await answer_temp(message, "Нужен файл-документ SQLite (.db).", user_id=message.from_user.id)
+        return
+
+    ext = os.path.splitext(doc.file_name or "")[1].lower()
+    if ext and ext != ".db":
+        await answer_temp(message, "Ожидался файл с расширением .db", user_id=message.from_user.id)
+        return
+
+    tmp_path = os.path.join(os.path.dirname(DB_NAME), f"_upload_{int(time.time())}_{doc.file_unique_id}.db")
+    try:
+        file_info = await message.bot.get_file(doc.file_id)
+        await message.bot.download_file(file_info.file_path, destination=tmp_path)
+
+        result = await import_local_db_from_file(tmp_path)
+        sync_result = result.get("sync", {})
+        sync_text = sync_result.get("message", "нет данных")
+        await answer_temp(
+            message,
+            "✅ <b>Импорт завершен.</b>\n"
+            f"{result.get('message', '')}\n\n"
+            f"🔄 <b>Результат sync:</b>\n{sync_text}",
+            user_id=message.from_user.id,
+        )
+        await state.clear()
+    except Exception as e:
+        await answer_temp(
+            message,
+            f"❌ <b>Импорт БД не выполнен</b>\n<code>{e}</code>",
+            user_id=message.from_user.id,
+        )
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass

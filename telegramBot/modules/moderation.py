@@ -10,7 +10,8 @@ from config import WARN_LIMIT, OWNER_ID
 from database import (
     get_list, manage_warn, get_user, 
     set_moderator_level, get_user_stats_full,
-    update_xp, reset_free_dice_cooldown
+    update_xp, reset_free_dice_cooldown,
+    farm_adjust_coins,
 )
 from utils import (
     answer_temp, get_user_link, delete_later, 
@@ -502,6 +503,44 @@ async def cmd_addxp(message: types.Message, command: CommandObject):
 
     await answer_temp(message, msg_text)
 
+
+@router.message(Command("addcoins", "givecoins", "farmcoins"))
+async def cmd_addcoins(message: types.Message, command: CommandObject):
+    await delete_later(message, 0)
+    if not await is_admin(message.chat, message.from_user.id, message.sender_chat, required_level=LVL_SENIOR):
+        return await answer_temp(message, "Доступно с уровня <b>Moder³ (3)</b>.")
+
+    args = command.args.split() if command.args else []
+    if len(args) < 2:
+        return await answer_temp(message, "Использование: <code>/addcoins @user [количество]</code>")
+
+    try:
+        amount = int(args[-1])
+    except ValueError:
+        return await answer_temp(message, "Сумма монет должна быть целым числом.")
+
+    if amount <= 0:
+        return await answer_temp(message, "Сумма должна быть больше 0.")
+
+    user_str = " ".join(args[:-1])
+    fake_msg = message.model_copy(update={'text': f"/cmd {user_str}"})
+    data = await parse_command_complex(fake_msg, user_str)
+    if not data['target_id']:
+        return await answer_temp(message, "Пользователь не найден.")
+
+    sender_lvl = await get_sender_level(message.chat, message.from_user.id)
+    target_lvl = await get_sender_level(message.chat, data['target_id'])
+    if target_lvl >= sender_lvl and message.from_user.id != OWNER_ID:
+        return await answer_temp(message, "Нельзя выдать монеты равному или старшему.")
+
+    new_balance = await farm_adjust_coins(data["target_id"], amount)
+    target_link = get_user_link(data["target_id"], data["target_name"])
+    await answer_temp(
+        message,
+        f"💰 Выдано <code>{amount}</code> монет игроку {target_link}.\n"
+        f"Новый баланс фермы: <code>{new_balance}</code> монет.",
+    )
+
 @router.message(Command("modhelp"))
 async def cmd_modhelp(message: types.Message):
     await delete_later(message, 0)
@@ -521,7 +560,8 @@ async def cmd_modhelp(message: types.Message):
         "<b>Moder³</b>\n"
         "• <code>/ban @username [причина] [Длительность]</code> — Заблокировать пользователя. Формат времени: 1d 1h 1m 1s\n"
         "• <code>/unban @username</code> — Снять блокировку с пользователя\n\n"
-        "• <code>/resetdice @username</code> — Сбросить КД бесплатного кубика (можно и reply)\n\n"
+        "• <code>/resetdice @username</code> — Сбросить КД бесплатного кубика (можно и reply)\n"
+        "• <code>/addcoins @username [количество]</code> — Выдать монеты фермы игроку\n\n"
         "<b>Manager</b>\n"
         "• <code>/setlevel @username [0-3]</code> — Назначить пользователю звание персонала.\n"
         "• <code>/addxp @username [количество]</code> — Выдать пользователю опыт"

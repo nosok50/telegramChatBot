@@ -9,6 +9,21 @@ from database import get_id_by_username
 # === 0. MESSAGE TRACKER (Singleton temp messages) ===
 # Stores {"scope_key": message_id}
 _active_temp_messages = {}
+_message_meta = {}
+_delete_tasks = {}
+_sticky_messages = {}
+
+
+def _msg_key(chat_id: int, message_id: int):
+    return f"{chat_id}:{message_id}"
+
+
+def _cancel_delete_task(chat_id: int, message_id: int):
+    k = _msg_key(chat_id, message_id)
+    task = _delete_tasks.get(k)
+    if task and not task.done():
+        task.cancel()
+    _delete_tasks.pop(k, None)
 
 
 def _scoped_key(
@@ -30,6 +45,92 @@ def _scoped_key(
     if resolved_user is None:
         return f"fallback:{chat_id}"
     return f"user:{chat_id}:{resolved_user}"
+
+
+def _sticky_scope(chat_id: int, scope: str) -> str:
+    return f"sticky:{chat_id}:{scope}"
+
+
+def is_anonymous_admin_message(message: types.Message) -> bool:
+    sender_chat = getattr(message, "sender_chat", None)
+    chat = getattr(message, "chat", None)
+    return bool(sender_chat and chat and sender_chat.id == chat.id)
+
+
+async def _send_sticky_message(
+    message: types.Message,
+    text: str = None,
+    photo: str = None,
+    reply: bool = False,
+    **kwargs,
+):
+    if photo is not None:
+        if reply:
+            return await message.reply_photo(photo=photo, caption=text, **kwargs)
+        return await message.answer_photo(photo=photo, caption=text, **kwargs)
+
+    if reply:
+        return await message.reply(text, **kwargs)
+    return await message.answer(text, **kwargs)
+
+
+async def replace_sticky_message(
+    message: types.Message,
+    scope: str,
+    text: str = None,
+    photo: str = None,
+    reply: bool = False,
+    **kwargs,
+):
+    chat_id = message.chat.id
+    scope_key = _sticky_scope(chat_id, scope)
+    old_msg_id = _sticky_messages.get(scope_key, {}).get("message_id")
+    if old_msg_id:
+        try:
+            await message.bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
+        except Exception:
+            pass
+
+    sent_msg = await _send_sticky_message(message, text=text, photo=photo, reply=reply, **kwargs)
+    _sticky_messages[scope_key] = {
+        "message_id": sent_msg.message_id,
+        "created_at": time.time(),
+        "normal_messages": 0,
+    }
+    return sent_msg
+
+
+async def ensure_sticky_message(
+    message: types.Message,
+    scope: str,
+    text: str = None,
+    min_age_seconds: int = 0,
+    min_normal_messages: int = 0,
+    photo: str = None,
+    reply: bool = False,
+    **kwargs,
+):
+    chat_id = message.chat.id
+    scope_key = _sticky_scope(chat_id, scope)
+    meta = _sticky_messages.get(scope_key)
+    now = time.time()
+
+    if not meta:
+        return await replace_sticky_message(message, scope, text=text, photo=photo, reply=reply, **kwargs)
+
+    age_ok = now - meta.get("created_at", 0) >= min_age_seconds
+    count_ok = meta.get("normal_messages", 0) >= min_normal_messages
+    if age_ok and count_ok:
+        return await replace_sticky_message(message, scope, text=text, photo=photo, reply=reply, **kwargs)
+    return None
+
+
+def bump_sticky_message_counter(chat_id: int, scope: str, amount: int = 1):
+    scope_key = _sticky_scope(chat_id, scope)
+    meta = _sticky_messages.get(scope_key)
+    if not meta:
+        return
+    meta["normal_messages"] = int(meta.get("normal_messages", 0)) + amount
 
 
 async def answer_temp(
@@ -54,6 +155,8 @@ async def answer_temp(
 
     old_msg_id = _active_temp_messages.get(scope_key)
     if old_msg_id:
+        _cancel_delete_task(chat_id, old_msg_id)
+        _message_meta.pop(_msg_key(chat_id, old_msg_id), None)
         try:
             await message.bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
         except Exception:
@@ -72,24 +175,50 @@ async def answer_temp(
                 sent_msg = await message.answer(text, **kwargs)
 
         _active_temp_messages[scope_key] = sent_msg.message_id
-        asyncio.create_task(delete_later(sent_msg, ttl, scope_key))
+        k = _msg_key(sent_msg.chat.id, sent_msg.message_id)
+        _message_meta[k] = {"scope_key": scope_key, "ttl": ttl}
+        task = asyncio.create_task(delete_later(sent_msg, ttl, scope_key))
+        _delete_tasks[k] = task
         return sent_msg
     except Exception:
         pass
 
 
-async def delete_later(message: types.Message, delay: int = 0, key: str = None):
-    if delay > 0:
-        await asyncio.sleep(delay)
+async def touch_temp_message(message: types.Message, delay: int = None):
+    """
+    Extends deletion timer for an already tracked temporary message.
+    Useful when user interacts with inline menu and message should stay alive.
+    """
+    k = _msg_key(message.chat.id, message.message_id)
+    meta = _message_meta.get(k)
+    if not meta:
+        return False
 
+    ttl = meta.get("ttl", AUTO_DELETE_TIME) if delay is None else delay
+    _cancel_delete_task(message.chat.id, message.message_id)
+    task = asyncio.create_task(delete_later(message, ttl, meta.get("scope_key")))
+    _delete_tasks[k] = task
+    _message_meta[k]["ttl"] = ttl
+    return True
+
+
+async def delete_later(message: types.Message, delay: int = 0, key: str = None):
     try:
+        if delay > 0:
+            await asyncio.sleep(delay)
+
         await message.delete()
+    except asyncio.CancelledError:
+        return
     except Exception:
         pass
 
     # Clear key only if it still points to this message.
     if key and _active_temp_messages.get(key) == message.message_id:
         del _active_temp_messages[key]
+    k = _msg_key(message.chat.id, message.message_id)
+    _message_meta.pop(k, None)
+    _delete_tasks.pop(k, None)
 
 
 # === 1. TEXT CLEANER & NORMALIZER ===
