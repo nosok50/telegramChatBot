@@ -184,6 +184,18 @@ async def answer_temp(
         pass
 
 
+async def answer_persistent(
+    message: types.Message,
+    text: str,
+    reply: bool = False,
+    **kwargs,
+):
+    """Send a moderation audit message that is never scheduled for deletion."""
+    if reply:
+        return await message.reply(text, **kwargs)
+    return await message.answer(text, **kwargs)
+
+
 async def touch_temp_message(message: types.Message, delay: int = None):
     """
     Extends deletion timer for an already tracked temporary message.
@@ -340,12 +352,41 @@ def get_user_link(user_id: int, full_name: str = "User"):
     return f'<a href="tg://user?id={user_id}">{full_name}</a>'
 
 
+def moderation_help_text(include_title: bool = True) -> str:
+    title = "🛡 <b>КОМАНДЫ МОДЕРАЦИИ</b>\n\n" if include_title else ""
+    return title + (
+        "<b>Moder¹</b>\n"
+        "• <code>/warn @user причина</code> — предупреждение\n"
+        "• <code>/unwarn @user</code> — снять предупреждение\n"
+        "• <code>/mute @user 1h причина</code> — выдать мут\n"
+        "• <code>/mute @user 1h -clear 10 причина</code> — мут и очистка сообщений\n"
+        "• <code>/clear @user 10</code> — очистка без наказания\n"
+        "• <code>/unmute @user</code> — снять мут\n"
+        "Можно отвечать командой на сообщение пользователя. Например: "
+        "<code>/mute 1h -clear 10 реклама</code> или <code>/clear 10</code>.\n\n"
+        "<b>Moder²</b>\n"
+        "• <code>/kick @user причина</code> — исключить из чата\n"
+        "• <code>/profile @user</code> — посмотреть профиль\n\n"
+        "<b>Moder³</b>\n"
+        "• <code>/ban @user 7d причина</code> — заблокировать\n"
+        "• <code>/unban @user</code> — снять блокировку\n"
+        "• <code>/resetdice @user</code> — сбросить бесплатный кубик\n"
+        "• <code>/addcoins @user 100</code> — выдать монеты\n\n"
+        "<b>Manager</b>\n"
+        "• <code>/setlevel @user 0-3</code> — изменить роль персонала\n"
+        "• <code>/addxp @user 100</code> — выдать опыт\n\n"
+        "Время: <code>m</code> — минуты, <code>h</code> — часы, <code>d</code> — дни."
+    )
+
+
 async def parse_command_complex(message: types.Message, args_str: str):
     target_id = None
     target_name = "User"
     duration = None
     reason_parts = []
     delete_msg_flag = False
+    clear_count = 0
+    parse_error = None
 
     args = args_str.split() if args_str else []
 
@@ -368,16 +409,40 @@ async def parse_command_complex(message: types.Message, args_str: str):
                     target_name = f"@{candidate}"
                     args.pop(0)
 
-    for arg in args:
+    index = 0
+    while index < len(args):
+        arg = args[index]
         if arg == "-del":
+            if clear_count:
+                parse_error = "Нельзя одновременно использовать -del и -clear."
             delete_msg_flag = True
+            index += 1
+            continue
+        if arg == "-clear":
+            if delete_msg_flag:
+                parse_error = "Нельзя одновременно использовать -del и -clear."
+            if index + 1 >= len(args):
+                parse_error = "После -clear укажите число сообщений от 1 до 100."
+                index += 1
+                continue
+            try:
+                parsed_count = int(args[index + 1])
+            except ValueError:
+                parsed_count = 0
+            if not 1 <= parsed_count <= 100:
+                parse_error = "Количество сообщений для очистки должно быть от 1 до 100."
+            else:
+                clear_count = parsed_count
+            index += 2
             continue
         if duration is None:
             parsed = parse_time(arg)
             if parsed:
                 duration = parsed
+                index += 1
                 continue
         reason_parts.append(arg)
+        index += 1
 
     reason = " ".join(reason_parts) if reason_parts else "Не указана"
     return {
@@ -386,4 +451,6 @@ async def parse_command_complex(message: types.Message, args_str: str):
         "duration": duration,
         "reason": reason,
         "delete_flag": delete_msg_flag,
+        "clear_count": clear_count,
+        "parse_error": parse_error,
     }

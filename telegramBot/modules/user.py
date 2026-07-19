@@ -8,7 +8,10 @@ from database import (
     get_top_users, get_user_rank, get_all_staff,
     get_free_dice_remaining, claim_free_dice,
     register_sync_activity,
+    get_month_score, get_month_leaders, get_month_wins, get_previous_month_title,
 )
+from engagement import process_chat_activity
+from modules.factory_orders import track_text_message, track_media_message, get_factory_order_stats
 from config import WARN_LIMIT, OWNER_ID
 from utils import (
     delete_later,
@@ -17,6 +20,7 @@ from utils import (
     bump_sticky_message_counter,
     replace_sticky_message,
     is_anonymous_admin_message,
+    moderation_help_text,
 )
 import time
 import asyncio
@@ -25,9 +29,8 @@ from datetime import datetime
 router = Router()
 
 # КЕШИ
-user_last_msg = {}
-media_cooldown = {}
-chat_last_active = {}
+# Прогресс активности хранится в SQLite, поэтому перезапуск не обнуляет волны
+# и не позволяет повторно получать XP за один и тот же контент.
 
 # URL КАРТИНОК
 IMG_LEVEL_3 = "https://i.ibb.co/S45s7p2D/Frame-26085979.png"
@@ -67,6 +70,16 @@ async def get_effective_level(user_id: int, chat: types.Chat, db_level: int, sen
 def format_xp(value):
     """Форматирует число с пробелами (10 000)"""
     return "{:,}".format(value).replace(",", " ")
+
+
+def format_month_key(key: str) -> str:
+    months = ("января", "февраля", "марта", "апреля", "мая", "июня",
+              "июля", "августа", "сентября", "октября", "ноября", "декабря")
+    try:
+        year, month = key.split("-")
+        return f"{months[int(month) - 1]} {year}"
+    except Exception:
+        return key
 
 # Хелпер для кнопки игры
 def get_game_btn_simple(game_key, user_level, title, callback_base, owner_id):
@@ -116,15 +129,26 @@ def help_main_text(user_level: int) -> str:
 def help_xp_text() -> str:
     return (
         "💡 <b>КАК ПОЛУЧАТЬ XP</b>\n\n"
-        "• Обычное сообщение: <code>+5 XP</code>\n"
+        "• Первый содержательный ответ после другого участника: <code>+5 XP</code>\n"
+        "• Прямой ответ участнику: <code>+5 XP</code>\n"
         "• Длинное сообщение (50+ символов): <code>+10 XP</code> сверху\n"
         "• Оживление чата после долгой паузы: <code>+50 XP</code>\n"
-        "• Фото/видео (раз в 10 минут): <code>+15 XP</code>\n"
-        "• Ночная активность (02:00-07:00): множитель <code>x1.5</code>\n"
-        "• Получение репутации от игрока уровня 4+: <code>+150 XP</code>\n"
+        "• Фото/видео: <code>+15 XP</code>\n"
+        "• Ответ уникального человека на ваш пост: <code>+5 XP</code>\n"
+        "• Волна из 4+ участников: каждому <code>+25 XP</code>\n"
+        "• Репутация от 4/5 уровня: <code>+150/+250 XP</code>\n"
+        "• Повторная репутация той же парой за 7 дней: <code>+25 XP</code>\n"
         "• Бесплатный кубик (раз в 12 часов): шанс <code>+50 XP</code>\n\n"
+        "Лимита сообщений в день нет. Копии, одни ссылки и эмодзи XP не дают.\n"
         "XP может как повышать, так и понижать уровень в играх и дуэлях."
     )
+
+
+def help_keyboard(can_moderate: bool = False) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="💡 Как получать XP", callback_data="help_xp")]]
+    if can_moderate:
+        rows.append([InlineKeyboardButton(text="🛡 Команды модерации", callback_data="help_moderation")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # --- КОМАНДЫ ---
 
@@ -148,11 +172,13 @@ async def cmd_help(message: types.Message):
     user_data = await get_user(message.from_user.id)
     lvl = user_data[4]
     text = help_main_text(lvl)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💡 Как получать XP", callback_data="help_xp")]
-        ]
+    effective_mod_level = await get_effective_level(
+        message.from_user.id,
+        message.chat,
+        int(user_data[6] or 0),
+        message.sender_chat,
     )
+    kb = help_keyboard(effective_mod_level >= 1)
 
     await answer_temp(
         message,
@@ -186,14 +212,45 @@ async def cb_help_xp(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "help_moderation")
+async def cb_help_moderation(callback: CallbackQuery):
+    user_data = await get_user(callback.from_user.id)
+    effective_mod_level = await get_effective_level(
+        callback.from_user.id,
+        callback.message.chat,
+        int(user_data[6] or 0),
+    )
+    if effective_mod_level < 1:
+        return await callback.answer("Нет доступа к командам модерации.", show_alert=True)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="help_back")]
+        ]
+    )
+    await answer_temp(
+        callback.message,
+        text=moderation_help_text(),
+        parse_mode="HTML",
+        reply_markup=kb,
+        global_key="help_menu",
+    )
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.answer()
+
+
 @router.callback_query(F.data == "help_back")
 async def cb_help_back(callback: CallbackQuery):
     user_data = await get_user(callback.from_user.id)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💡 Как получать XP", callback_data="help_xp")]
-        ]
+    effective_mod_level = await get_effective_level(
+        callback.from_user.id,
+        callback.message.chat,
+        int(user_data[6] or 0),
     )
+    kb = help_keyboard(effective_mod_level >= 1)
     await answer_temp(
         callback.message,
         text=help_main_text(user_data[4]),
@@ -253,23 +310,7 @@ async def cmd_staff(message: types.Message):
             text_lines.append("")
 
     # 2. Список команд
-    text_commands = (
-        "<b>Moder¹</b>\n"
-        "• <code>/warn @user [причина]</code> — Выдать предупреждение (3 пред. = блок 30 мин)\n"
-        "• <code>/unwarn @user</code> — Снять предупреждение\n"
-        "• <code>/mute @user [причина] [время]</code> — Ограничить чат. Формат: 1d 1h 1m\n"
-        "• <code>/unmute @user</code> — Снять ограничение\n"
-        "• <code>/modhelp</code> — Эта панель\n\n"
-        "<b>Moder²</b>\n"
-        "• <code>/kick @user [причина]</code> — Исключить пользователя\n"
-        "• <code>/profile @user</code> — Просмотр чужого профиля\n\n"
-        "<b>Moder³</b>\n"
-        "• <code>/ban @user [причина] [время]</code> — Заблокировать пользователя\n"
-        "• <code>/unban @user</code> — Снять блокировку\n\n"
-        "<b>Manager</b>\n"
-        "• <code>/setlevel @user [0-3]</code> — Назначить персонал\n"
-        "• <code>/addxp @user [кол-во]</code> — Выдать опыт"
-    )
+    text_commands = moderation_help_text(include_title=False)
     
     full_text = "\n".join(text_lines) + "\n" + "_"*15 + "\n\n" + text_commands
             
@@ -298,7 +339,9 @@ async def cmd_leaders(message: types.Message):
 
 async def generate_leaders_text(user_id):
     top_users = await get_top_users(limit=10)
-    text = "🏆 <b>ТОП ЛИДЕРОВ</b>\n\n"
+    month_users = await get_month_leaders(limit=10)
+    title = await get_previous_month_title()
+    text = "🏆 <b>ОБЩИЙ ТОП</b>\n\n"
     
     top_ids = []
 
@@ -313,6 +356,15 @@ async def generate_leaders_text(user_id):
             rank, my_lvl, my_xp = my_stats
             text += f"\n\n<b>{rank}.</b> [LEVEL <b>{my_lvl}</b>] Вы (<code>{format_xp(my_xp)} XP</code>)"
         
+    text += "\n\n📅 <b>АКТИВНОСТЬ ЭТОГО МЕСЯЦА</b>\n"
+    if month_users:
+        for i, (name, score, uid) in enumerate(month_users, 1):
+            text += f"\n<b>{i}.</b> <a href='tg://user?id={uid}'>{name}</a> — <code>{format_xp(score)} XP</code>"
+    else:
+        text += "\nПока никто не заработал XP за полезную активность."
+    if title:
+        key, uid, name = title
+        text += f"\n\n👑 Лидер {format_month_key(key)}: <a href='tg://user?id={uid}'>{name}</a>"
     return text
 
 @router.message(Command("profile"))
@@ -406,6 +458,19 @@ async def generate_profile_content(user_id):
     if rep > 0:
         rep_line = f"\n🤝 Репутация: <b>{rep}</b>"
 
+    month_score, month_rank = await get_month_score(user_id)
+    wins, last_win = await get_month_wins(user_id)
+    month_line = f"\n📅 За месяц: <b>{format_xp(month_score)} XP</b>"
+    if month_rank:
+        month_line += f" · место <b>#{month_rank}</b>"
+    if wins:
+        month_line += f"\n🏅 Побед в месяце: <b>{wins}</b> (последняя: {format_month_key(last_win)})"
+    orders, successful, involved, distributed = await get_factory_order_stats(user_id)
+    factory_line = ""
+    if orders:
+        factory_line = (f"\n🏭 Заказы: <b>{successful}/{orders}</b> успешно"
+                        f" · участников <b>{involved}</b> · банк <b>{format_xp(distributed)} XP</b>")
+
     warn_text = ""
     if warns > 0:
         reasons_list = await get_warn_reasons(user_id)
@@ -417,7 +482,7 @@ async def generate_profile_content(user_id):
 
     profile_text = (
         f"👤 Профиль: {name_line}"
-        f"{rep_line}\n\n"
+        f"{rep_line}{month_line}{factory_line}\n\n"
         f"{level_display}: {progress_bar}\n"
         f"{xp_line}"
         f"{warn_text}" 
@@ -739,7 +804,6 @@ async def text_handler(message: types.Message):
         return
     
     user_id = message.from_user.id
-    now = time.time()
     text = message.text
     
     # 1. СИСТЕМА РЕПУТАЦИИ (+rep)
@@ -764,12 +828,14 @@ async def text_handler(message: types.Message):
             target_id = message.reply_to_message.from_user.id
             result = await give_reputation(user_id, target_id)
             
-            if result == "success":
-                old, new, added = await update_xp(target_id, 150)
+            if result in ("success_full", "success_repeat"):
+                full_reward = 250 if giver_rpg_lvl >= 5 else 150
+                reward = 25 if result == "success_repeat" else full_reward
+                old, new, added = await update_xp(target_id, reward, count_monthly=True)
                 await answer_temp(
                     message,
                     f"🤝 {message.from_user.mention_html()} повысил репутацию {message.reply_to_message.from_user.mention_html()}!\n"
-                    f"Получено <code>+150 XP</code>."
+                    f"Получено <code>+{reward} XP</code>."
                 )
             elif result == "daily_limit_user":
                 await answer_temp(message, "⚠️ Вы уже повышали репутацию этому игроку сегодня.")
@@ -782,21 +848,9 @@ async def text_handler(message: types.Message):
             await answer_temp(message, "🔒 <b>Репутация доступна с 4 уровня!</b>")
             return
             
-    # 2. ФАРМ XP
-    last_msg = user_last_msg.get(user_id, 0)
-    if now - last_msg < 60:
-        return
-    user_last_msg[user_id] = now
-    
-    earned_xp = 5
-    
-    clean_text = ' '.join([w for w in text.split() if not w.startswith('http')])
-    if len(clean_text) > 50:
-        earned_xp += 10
-        
-    chat_last = chat_last_active.get(message.chat.id, now)
-    if now - chat_last > 3600:
-        earned_xp += 50
+    result = await process_chat_activity(message, is_media=False)
+    await track_text_message(message)
+    if result["revived"]:
         await replace_sticky_message(
             message,
             scope="chat_revived_notice",
@@ -808,30 +862,8 @@ async def text_handler(message: types.Message):
             parse_mode="HTML",
         )
     
-    chat_last_active[message.chat.id] = now
-    
-    current_hour = datetime.now().hour
-    if 2 <= current_hour < 7:
-        earned_xp = int(earned_xp * 1.5)
-        
-    await get_user(user_id, message.from_user.username, message.from_user.full_name)
-    old_lvl, new_lvl, _ = await update_xp(user_id, earned_xp)
-    
-    # ИЗМЕНЕНО: LEVEL UP/DOWN -> Уровень повышен/понижен
-    if new_lvl > old_lvl:
-        await answer_temp(
-            message,
-            f"🆙 <b>Уровень повышен до {new_lvl}!</b>\n"
-            f"{message.from_user.mention_html()} достиг новых высот!",
-            reply=True,
-        )
-    elif new_lvl < old_lvl:
-        await answer_temp(
-            message,
-            f"📉 <b>Уровень понижен до {new_lvl}...</b>\n"
-            f"{message.from_user.mention_html()} потерял позиции.",
-            reply=True,
-        )
+    if result["wave_users"]:
+        await answer_temp(message, f"🌊 <b>Волна активности!</b> {len(result['wave_users'])} участника получили по <code>+25 XP</code>.")
 
 # --- ХЕНДЛЕР КОНТЕНТА (Видео/Фото) ---
 @router.message(F.photo | F.video)
@@ -844,23 +876,9 @@ async def media_handler(message: types.Message):
     if not message.from_user:
         return
     
-    user_id = message.from_user.id
-    now = time.time()
-    
-    last_media = media_cooldown.get(user_id, 0)
-    
-    if now - last_media > 600:
-        media_cooldown[user_id] = now
-        
-        await get_user(user_id, message.from_user.username, message.from_user.full_name)
-        
-        amount = 15
-        current_hour = datetime.now().hour
-        if 2 <= current_hour < 7:
-            amount = int(amount * 1.5)
-            
-        old_lvl, new_lvl, _ = await update_xp(user_id, amount)
-        
-        # ИЗМЕНЕНО: LEVEL UP
-        if new_lvl > old_lvl:
-            await answer_temp(message, f"🆙 <b>Уровень повышен до {new_lvl}! (Контент-мейкер)</b>", reply=True)
+    result = await process_chat_activity(message, is_media=True)
+    await track_media_message(message)
+    if result["revived"]:
+        await answer_temp(message, f"⚡ {message.from_user.mention_html()} оживил чат и получил <code>+50 XP</code>.")
+    if result["wave_users"]:
+        await answer_temp(message, f"🌊 <b>Волна активности!</b> {len(result['wave_users'])} участника получили по <code>+25 XP</code>.")

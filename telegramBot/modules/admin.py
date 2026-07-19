@@ -389,6 +389,7 @@ async def build_db_status_view(include_back: bool = False):
         f"• <b>Локальная БД:</b>\n<code>{status['db_path']}</code>\n"
         f"• <b>Neon настроен:</b> <code>{status['neon_configured']}</code>\n"
         f"• <b>Neon сейчас подключен:</b> <code>{status['neon_connected']}</code>\n"
+        f"• <b>Startup-восстановление завершено:</b> <code>{status['bootstrap_complete']}</code>\n"
         f"• <b>Событийный sync-цикл активен:</b> <code>{status['sync_loop_running']}</code>\n"
         f"• <b>Таблицы с несинхронизированными изменениями:</b>\n<code>{dirty}</code>\n"
         f"• <b>Локальных изменений с прошлого sync:</b> <code>{status['local_change_count']}</code>\n"

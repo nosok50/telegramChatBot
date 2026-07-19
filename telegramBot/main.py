@@ -7,10 +7,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommandScopeDefault
 from config import BOT_TOKEN, COMMANDS
-from database import create_tables, DB_NAME
+from database import create_tables, DB_NAME, start_month_processor
+from engagement import create_engagement_tables
 
 # Импорт модулей
-from modules import admin, moderation, user, games 
+from modules import admin, moderation, user, games, factory_orders
 
 # Импорт функции для Render
 from keep_alive import keep_alive 
@@ -24,6 +25,7 @@ async def main():
 
     # Инициализация БД
     await create_tables()
+    await create_engagement_tables()
     print(f"DB path: {DB_NAME}")
     
     bot = Bot(
@@ -35,10 +37,14 @@ async def main():
     # Регистрация роутеров
     dp.include_router(admin.router)
     dp.include_router(moderation.router)
+    dp.include_router(factory_orders.router)
     dp.include_router(user.router)
     dp.include_router(games.router)
 
     await bot.set_my_commands(COMMANDS, scope=BotCommandScopeDefault())
+    factory_orders.start_factory_processor(bot)
+    games.start_duel_processor(bot)
+    start_month_processor()
 
     print("Бот запущен. Система уровней 2.0 активирована.")
     await bot.delete_webhook(drop_pending_updates=True)

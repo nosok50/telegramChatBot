@@ -25,6 +25,12 @@ from database import (
     FARM_SPEED_BONUS,
     FARM_STABILIZER_REDUCTION,
     FARM_SUPPORT_COSTS,
+    total_available_xp, save_active_duel, load_active_duel, delete_active_duel,
+    duel_pair_count_today,
+    farm_is_complete,
+    expire_stale_duels,
+    escrow_active_duel,
+    settle_active_duel,
 )
 from utils import (
     delete_later,
@@ -34,6 +40,11 @@ from utils import (
     ensure_sticky_message,
 )
 import asyncio
+import html
+import random
+import time
+from collections import defaultdict
+from functools import wraps
 from config import OWNER_ID
 
 router = Router()
@@ -48,6 +59,24 @@ GAME_REQS = {
 }
 
 active_duels = {}
+_duel_processor_task = None
+_duel_locks = defaultdict(asyncio.Lock)
+
+
+def _serialized_duel(handler):
+    @wraps(handler)
+    async def wrapped(callback, *args, **kwargs):
+        async with _duel_locks[callback.message.chat.id]:
+            return await handler(callback, *args, **kwargs)
+    return wrapped
+
+GAME_BETS_BY_LEVEL = {
+    1: (50,),
+    2: (50, 100, 500),
+    3: (100, 500, 2000),
+    4: (500, 2000, 5000),
+    5: (1000, 5000, 10000),
+}
 
 GAME_UI = {
     "dice": {
@@ -432,8 +461,27 @@ async def _farm_render_main(owner_id: int):
     if state.get("moving_from") is not None:
         kb_rows.append([InlineKeyboardButton(text="❌ Отменить перемещение", callback_data=f"farm_move_cancel:{owner_id}")])
     kb_rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"farm_open:{owner_id}")])
+    if await farm_is_complete(owner_id):
+        kb_rows.append([InlineKeyboardButton(text="📦 Заводские заказы", callback_data=f"farm_orders:{owner_id}")])
     kb_rows.append([InlineKeyboardButton(text="🎮 Назад в игры", callback_data=f"back_to_games:{owner_id}")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows), state
+
+
+@router.callback_query(F.data.startswith("farm_orders:"))
+async def farm_orders_info(callback: types.CallbackQuery):
+    owner_id = int(callback.data.split(":")[1])
+    if callback.from_user.id != owner_id:
+        return await callback.answer("Это не ваш завод.", show_alert=True)
+    await callback.answer()
+    await callback.message.answer(
+        "📦 <b>Заводские заказы</b>\n\n"
+        "Запускаются в групповом чате:\n"
+        "<code>/factory_order discussion small тема</code>\n"
+        "<code>/factory_order photo medium тема</code>\n"
+        "<code>/factory_order tournament large</code>\n\n"
+        "Small: 50 000 монет → банк 500 XP\n"
+        "Medium: 200 000 → 2 000 XP\n"
+        "Large: 500 000 → 5 000 XP")
 
 
 async def _farm_render_locked_cell(owner_id: int, state: dict, cell_idx: int):
@@ -1008,19 +1056,12 @@ async def game_bet_menu(callback: types.CallbackQuery):
         {"emoji": "🎮", "name": "Игра", "desc": "Сделайте ставку.", "hint": "Результат зависит от удачи."},
     )
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="50 XP", callback_data=f"play_{game_name}:50:{owner_id}"),
-                InlineKeyboardButton(text="100 XP", callback_data=f"play_{game_name}:100:{owner_id}"),
-                InlineKeyboardButton(text="500 XP", callback_data=f"play_{game_name}:500:{owner_id}"),
-            ],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data=f"back_to_games:{owner_id}")],
-        ]
-    )
-
     user_data = await get_user(owner_id)
     current_xp = user_data[3] if user_data else 0
+    level = user_data[4] if user_data else 1
+    bet_buttons = [InlineKeyboardButton(text=f"{bet} XP", callback_data=f"play_{game_name}:{bet}:{owner_id}")
+                   for bet in GAME_BETS_BY_LEVEL.get(level, GAME_BETS_BY_LEVEL[1])]
+    kb = InlineKeyboardMarkup(inline_keyboard=[bet_buttons, [InlineKeyboardButton(text="🔙 Назад", callback_data=f"back_to_games:{owner_id}")]])
     display_name = "Group Anonymous Bot" if owner_id == ANON_BOT_ID else ((user_data[2] if user_data else "") or "Игрок")
     text = build_game_panel_text(
         owner_id,
@@ -1070,6 +1111,8 @@ async def play_game_logic(callback: types.CallbackQuery):
     user_data = await get_user(player_id, player_username, player_fullname)
     if not user_data:
         return await callback.answer("Ошибка профиля.", show_alert=True)
+    if bet not in GAME_BETS_BY_LEVEL.get(user_data[4], ()):
+        return await callback.answer("Эта ставка недоступна на вашем уровне.", show_alert=True)
     if not can_afford(user_data[3], user_data[4], bet):
         return await callback.answer(f"Не хватает XP. У вас {fmt_num(user_data[3])} XP.", show_alert=True)
 
@@ -1169,12 +1212,15 @@ async def duel_info_menu(callback: types.CallbackQuery):
         "• ⚔️ Атака побеждает 🛡 Оборону\n"
         "• 🛡 Оборона побеждает ⚡ Хитрость\n"
         "• ⚡ Хитрость побеждает ⚔️ Атаку\n"
-        "• Одинаковый выбор = ничья\n\n"
+        "• Сильная тактика дает 70% на победу, слабая сохраняет 30%\n"
+        "• Одинаковый выбор = ничья и возврат ставок\n\n"
+        "Ставка — не более 5% XP более бедного игрока и не более 10 000 XP.\n"
+        "Комиссия одной пары за день: 10%, 25%, 50%, затем 75%. С новым соперником снова 10%.\n\n"
         "<b>Как начать:</b>\n"
         "1. Вызов: <code>/duel @username [ставка]</code>\n"
         "2. Соперник принимает дуэль\n"
         "3. Оба выбирают тактику\n"
-        "4. Победитель получает XP, проигравший теряет XP"
+        "4. При принятии ставки уходят в банк; победитель получает банк за вычетом комиссии"
     )
     if callback.message.photo:
         await callback.message.edit_caption(caption=text, parse_mode="HTML", reply_markup=kb)
@@ -1245,15 +1291,30 @@ async def cmd_duel(message: types.Message, command: CommandObject):
     if target_id == initiator.id:
         return await answer_temp(message, "🤡 Нельзя вызвать самого себя.", reply=True)
 
-    active_duels[message.chat.id] = {
+    target_data = await get_user(target_id)
+    if not target_data:
+        return await answer_temp(message, "❌ У соперника еще нет профиля.", reply=True)
+    max_bet = min(10000, int(min(total_available_xp(init_data[3], init_data[4]),
+                                 total_available_xp(target_data[3], target_data[4])) * 0.05))
+    if max_bet < 10:
+        return await answer_temp(message, "❌ У одного из игроков пока недостаточно XP для дуэли.", reply=True)
+    if bet > max_bet:
+        return await answer_temp(message, f"⚠️ Максимальная ставка для этой пары: <code>{fmt_num(max_bet)} XP</code>.", reply=True)
+    if await load_active_duel(message.chat.id):
+        return await answer_temp(message, "⚠️ В этом чате уже идет дуэль.", reply=True)
+
+    duel = {
+        "chat_id": message.chat.id,
         "initiator": initiator.id,
         "target": target_id,
         "bet": bet,
-        "initiator_name": initiator.full_name,
-        "target_name": target_name,
+        "initiator_name": html.escape(initiator.full_name or "Игрок"),
+        "target_name": html.escape(str(target_name or "Игрок")),
         "state": "waiting_accept",
         "p1_choice": None,
         "p2_choice": None,
+        "escrowed": False,
+        "created_at": int(time.time()),
     }
 
     kb = InlineKeyboardMarkup(
@@ -1261,18 +1322,23 @@ async def cmd_duel(message: types.Message, command: CommandObject):
     )
     text = (
         "🥊 <b>Вызов на дуэль</b>\n"
-        f"🔴 <b>{initiator.full_name}</b> VS 🔵 <b>{target_name}</b>\n"
+        f"🔴 <b>{duel['initiator_name']}</b> VS 🔵 <b>{duel['target_name']}</b>\n"
         f"💰 Банк: <code>{fmt_num(bet * 2)} XP</code>\n\n"
-        f"Ждем подтверждения от {target_name}."
+        f"Ждем подтверждения от {duel['target_name']}."
     )
-    await answer_temp(message, text, reply_markup=kb)
+    sent = await answer_temp(message, text, reply_markup=kb)
+    if sent:
+        duel["message_id"] = sent.message_id
+    active_duels[message.chat.id] = duel
+    await save_active_duel(duel)
 
 
 @router.callback_query(F.data == "duel_accept")
+@_serialized_duel
 async def duel_accept(callback: types.CallbackQuery):
     await touch_temp_message(callback.message)
     chat_id = callback.message.chat.id
-    duel = active_duels.get(chat_id)
+    duel = active_duels.get(chat_id) or await load_active_duel(chat_id)
     if not duel or duel["state"] != "waiting_accept":
         return await callback.answer("Дуэль уже неактивна.", show_alert=True)
 
@@ -1293,7 +1359,19 @@ async def duel_accept(callback: types.CallbackQuery):
     if not can_afford(target_data[3], target_data[4], duel["bet"]):
         return await callback.answer("Не хватает XP для принятия ставки.", show_alert=True)
 
+    init_data = await get_user(duel["initiator"])
+    if not init_data or not can_afford(init_data[3], init_data[4], duel["bet"]):
+        return await callback.answer("У инициатора больше нет XP на эту ставку.", show_alert=True)
+    max_bet = min(10000, int(min(total_available_xp(init_data[3], init_data[4]),
+                                 total_available_xp(target_data[3], target_data[4])) * 0.05))
+    if duel["bet"] > max_bet:
+        return await callback.answer(f"Лимит пары снизился до {max_bet} XP. Создайте новый вызов.", show_alert=True)
+
+    if not await escrow_active_duel(chat_id):
+        return await callback.answer("Дуэль уже принята либо баланс изменился.", show_alert=True)
     duel["state"] = "fighting"
+    duel["escrowed"] = True
+    active_duels[chat_id] = duel
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⚔️ Атака", callback_data="tactics_atk")],
@@ -1310,10 +1388,11 @@ async def duel_accept(callback: types.CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("tactics_"))
+@_serialized_duel
 async def duel_tactics(callback: types.CallbackQuery):
     await touch_temp_message(callback.message)
     chat_id = callback.message.chat.id
-    duel = active_duels.get(chat_id)
+    duel = active_duels.get(chat_id) or await load_active_duel(chat_id)
     user_id = callback.from_user.id
     if not duel or duel["state"] != "fighting":
         return await callback.answer("Дуэль неактивна.")
@@ -1337,6 +1416,8 @@ async def duel_tactics(callback: types.CallbackQuery):
         if duel["p2_choice"]:
             return await callback.answer("Вы уже выбрали.", show_alert=True)
         duel["p2_choice"] = choice
+    active_duels[chat_id] = duel
+    await save_active_duel(duel)
     await callback.answer(f"Выбрано: {choice_name}")
 
     if duel["p1_choice"] and duel["p2_choice"]:
@@ -1361,14 +1442,17 @@ async def resolve_duel(message: types.Message, duel):
     p2 = duel["p2_choice"]
 
     winner = None
+    tactical_winner = None
     if p1 == p2:
         winner = None
     elif p1 == "atk":
-        winner = 1 if p2 == "trick" else 2
+        tactical_winner = 1 if p2 == "trick" else 2
     elif p1 == "def":
-        winner = 1 if p2 == "atk" else 2
+        tactical_winner = 1 if p2 == "atk" else 2
     elif p1 == "trick":
-        winner = 1 if p2 == "def" else 2
+        tactical_winner = 1 if p2 == "def" else 2
+    if tactical_winner:
+        winner = tactical_winner if random.random() < 0.70 else (2 if tactical_winner == 1 else 1)
 
     t_map = {"atk": "Атака ⚔️", "def": "Оборона 🛡", "trick": "Хитрость ⚡"}
     res_text = (
@@ -1378,6 +1462,7 @@ async def resolve_duel(message: types.Message, duel):
     )
 
     if winner is None:
+        await settle_active_duel(duel)
         res_text += "🤝 <b>Ничья.</b> Ставки возвращены."
     else:
         w_id = duel["initiator"] if winner == 1 else duel["target"]
@@ -1385,8 +1470,11 @@ async def resolve_duel(message: types.Message, duel):
         w_name = duel["initiator_name"] if winner == 1 else duel["target_name"]
         l_name = duel["target_name"] if winner == 1 else duel["initiator_name"]
 
-        old_lvl_w, new_lvl_w, _ = await update_xp(w_id, duel["bet"])
-        old_lvl_l, new_lvl_l, _ = await update_xp(l_id, -duel["bet"])
+        completed_today = await duel_pair_count_today(duel["initiator"], duel["target"])
+        commission = (10, 25, 50, 75)[min(completed_today, 3)]
+        bank = duel["bet"] * 2
+        payout = bank * (100 - commission) // 100
+        await settle_active_duel(duel, w_id, commission)
 
         flavor = ""
         combo = (p1, p2) if winner == 1 else (p2, p1)
@@ -1400,14 +1488,32 @@ async def resolve_duel(message: types.Message, duel):
         res_text += (
             f"🏆 <b>Победитель: {w_name}</b>\n"
             f"💬 <i>{flavor}</i>\n"
-            f"💰 <b>{w_name}</b>: <code>+{fmt_num(duel['bet'])} XP</code>\n"
-            f"💀 <b>{l_name}</b>: <code>-{fmt_num(duel['bet'])} XP</code>\n"
+            f"💰 <b>{w_name}</b> получает банк: <code>{fmt_num(payout)} XP</code>\n"
+            f"💀 <b>{l_name}</b> теряет ставку: <code>{fmt_num(duel['bet'])} XP</code>\n"
+            f"🏦 Комиссия пары: <code>{commission}%</code>\n"
         )
-        if new_lvl_w > old_lvl_w:
-            res_text += f"🆙 <b>{w_name}</b> повысил уровень до {new_lvl_w}.\n"
-        if new_lvl_l < old_lvl_l:
-            res_text += f"📉 <b>{l_name}</b> понизил уровень до {new_lvl_l}."
 
     active_duels.pop(message.chat.id, None)
     sent_msg = await message.edit_text(res_text, reply_markup=None)
     await delete_later(sent_msg, 60)
+
+
+async def _duel_processor(bot):
+    while True:
+        try:
+            expired = await expire_stale_duels(900)
+            for chat_id, escrowed in expired:
+                active_duels.pop(chat_id, None)
+                text = "⌛ Дуэль отменена по тайм-ауту."
+                if escrowed:
+                    text += " Обе ставки возвращены."
+                await bot.send_message(chat_id, text)
+        except Exception:
+            pass
+        await asyncio.sleep(30)
+
+
+def start_duel_processor(bot):
+    global _duel_processor_task
+    if not _duel_processor_task or _duel_processor_task.done():
+        _duel_processor_task = asyncio.create_task(_duel_processor(bot))

@@ -8,7 +8,9 @@ import json
 import os
 import sqlite3
 import random
-from datetime import datetime
+import tempfile
+from contextlib import closing
+from datetime import datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 DEFAULT_DB_FILENAME = "bot_database.db"
@@ -42,10 +44,10 @@ if db_dir:
 
 # РљРѕРЅС„РёРіСѓСЂР°С†РёСЏ СѓСЂРѕРІРЅРµР№ (XP Cap РґР»СЏ РєР°Р¶РґРѕРіРѕ СѓСЂРѕРІРЅСЏ)
 LEVEL_CAPS = {
-    1: 500,
-    2: 2000,
-    3: 8000,
-    4: 25000,
+    1: 10000,
+    2: 20000,
+    3: 70000,
+    4: 200000,
     5: float('inf')
 }
 FREE_DICE_COOLDOWN_SECONDS = 12 * 60 * 60
@@ -57,8 +59,26 @@ FARM_STARTER_COINS = 150
 FARM_BASE_CYCLE_SECONDS = 4 * 60 * 60
 FARM_BASE_CAP_SECONDS = 4 * 60 * 60
 
-SYNCABLE_TABLES = ["users", "rep_history", "whitelist", "badwords", "warn_reasons", "farm_players", "farm_cells"]
-DEFAULT_NEON_DSN = "postgresql://neondb_owner:npg_jPzy6UoZY3pe@ep-patient-tooth-albqdusn-pooler.c-3.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+SYNCABLE_TABLES = [
+    "users", "rep_history", "whitelist", "badwords", "warn_reasons",
+    "farm_players", "farm_cells", "month_scores", "month_results",
+    "duel_history", "active_duels", "factory_orders",
+    "factory_order_participants", "factory_order_messages", "factory_order_votes",
+]
+
+MONTH_PRIZES = (10000, 5000, 2500)
+_month_finalize_lock = asyncio.Lock()
+_month_processor_task = None
+EXTRA_SYNC_COLUMNS = {
+    "month_scores": ("month_key", "user_id", "xp_earned"),
+    "month_results": ("month_key", "winner_id", "second_id", "third_id", "finalized_at"),
+    "duel_history": ("id", "chat_id", "player1_id", "player2_id", "bet", "result", "commission_rate", "created_at", "resolved_at"),
+    "active_duels": ("chat_id", "message_id", "player1_id", "player2_id", "player1_name", "player2_name", "bet", "state", "player1_choice", "player2_choice", "escrowed", "created_at"),
+    "factory_orders": ("id", "chat_id", "owner_id", "order_type", "size", "coin_cost", "xp_bank", "topic", "status", "message_id", "vote_message_id", "created_at", "stage_ends_at", "metadata", "distributed_xp"),
+    "factory_order_participants": ("order_id", "user_id", "display_name", "submission_message_id", "replies_received", "joined_at"),
+    "factory_order_messages": ("order_id", "message_id", "author_id", "parent_author_id"),
+    "factory_order_votes": ("order_id", "voter_id", "candidate_id"),
+}
 
 
 def _normalize_neon_dsn(raw_dsn: str) -> str:
@@ -72,7 +92,7 @@ def _normalize_neon_dsn(raw_dsn: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
-NEON_DSN = _normalize_neon_dsn(os.getenv("DATABASE_URL") or os.getenv("NEON_DATABASE_URL") or DEFAULT_NEON_DSN)
+NEON_DSN = _normalize_neon_dsn(os.getenv("DATABASE_URL") or os.getenv("NEON_DATABASE_URL") or "")
 # Optional local cooldown between event-driven sync condition checks.
 SYNC_CHECK_INTERVAL_SECONDS = int(os.getenv("DB_SYNC_CHECK_INTERVAL", "0"))
 # Minimum time between successful sync runs.
@@ -92,6 +112,11 @@ _sync_wakeup_event = asyncio.Event()
 _last_neon_error = ""
 _last_sync_check_at = 0.0
 _db_import_lock = asyncio.Lock()
+_neon_pool_lock = asyncio.Lock()
+_sync_execution_lock = asyncio.Lock()
+_retry_wakeup_task = None
+_bootstrap_complete = False
+_neon_had_failure = False
 
 
 def _set_last_neon_error(text: str):
@@ -197,7 +222,26 @@ async def _resolve_alert_user_id() -> int:
         return 0
 
 
-async def _send_db_alert(event_key: str, text: str):
+def _create_sqlite_snapshot() -> str:
+    """Create a consistent SQLite copy that can safely be sent while the bot writes."""
+    snapshot_dir = os.path.dirname(os.path.abspath(DB_NAME)) or "."
+    fd, snapshot_path = tempfile.mkstemp(prefix="bot_backup_", suffix=".db", dir=snapshot_dir)
+    os.close(fd)
+    try:
+        with closing(sqlite3.connect(DB_NAME, timeout=30)) as source:
+            with closing(sqlite3.connect(snapshot_path, timeout=30)) as target:
+                source.backup(target)
+                target.commit()
+        return snapshot_path
+    except Exception:
+        try:
+            os.remove(snapshot_path)
+        except OSError:
+            pass
+        raise
+
+
+async def _send_db_alert(event_key: str, text: str, attach_backup: bool = True):
     global _last_alert_key, _last_alert_at
     now = _now_ts()
     # Anti-spam: same event key no more than once per 5 minutes.
@@ -220,58 +264,108 @@ async def _send_db_alert(event_key: str, text: str):
     payload = {"chat_id": user_id, "text": f"[DB] {text}"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=10):
-                pass
-            await _send_db_file_to_owner(session, BOT_TOKEN, user_id, event_key)
+            async with session.post(url, json=payload, timeout=10) as response:
+                if response.status >= 400:
+                    details = (await response.text())[:300]
+                    raise RuntimeError(f"Telegram sendMessage HTTP {response.status}: {details}")
+            if attach_backup:
+                await _send_db_file_to_owner(session, BOT_TOKEN, user_id, event_key)
         _last_alert_key = event_key
         _last_alert_at = now
-    except Exception:
-        pass
+    except Exception as e:
+        logging.error("DB alert delivery failed (%s): %s: %s", event_key, type(e).__name__, e)
 
 
 async def _send_db_file_to_owner(session: aiohttp.ClientSession, token: str, user_id: int, event_key: str):
     if not os.path.exists(DB_NAME):
         return
+    snapshot_path = None
     try:
-        file_size = os.path.getsize(DB_NAME)
-    except Exception:
-        return
-    # Telegram bot API document size limit is much higher than our expected SQLite backups,
-    # but keep a hard cap to avoid unexpected huge uploads on free hosting.
-    if file_size > 45 * 1024 * 1024:
-        return
+        snapshot_path = await asyncio.to_thread(_create_sqlite_snapshot)
+        file_size = os.path.getsize(snapshot_path)
+        # Keep a hard cap to avoid unexpected huge uploads on free hosting.
+        if file_size > 45 * 1024 * 1024:
+            raise RuntimeError(f"SQLite backup is too large: {file_size} bytes")
 
-    url = f"https://api.telegram.org/bot{token}/sendDocument"
-    form = aiohttp.FormData()
-    form.add_field("chat_id", str(user_id))
-    form.add_field("caption", f"[DB] Резервная копия ({event_key})")
-    with open(DB_NAME, "rb") as db_file:
+        url = f"https://api.telegram.org/bot{token}/sendDocument"
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(user_id))
+        form.add_field("caption", f"[DB] Резервная копия ({event_key})")
+        db_file = open(snapshot_path, "rb")
         form.add_field(
             "document",
             db_file,
             filename=os.path.basename(DB_NAME),
             content_type="application/octet-stream",
         )
-        async with session.post(url, data=form, timeout=30):
+        try:
+            async with session.post(url, data=form, timeout=30) as response:
+                if response.status >= 400:
+                    details = (await response.text())[:300]
+                    raise RuntimeError(f"Telegram sendDocument HTTP {response.status}: {details}")
+        finally:
+            db_file.close()
+    finally:
+        if snapshot_path:
+            try:
+                os.remove(snapshot_path)
+            except OSError:
+                pass
+
+
+async def _reset_neon_pool():
+    global _neon_pool
+    async with _neon_pool_lock:
+        pool = _neon_pool
+        _neon_pool = None
+    if not pool:
+        return
+    try:
+        await asyncio.wait_for(pool.close(), timeout=5)
+    except Exception:
+        try:
+            pool.terminate()
+        except Exception:
             pass
 
 
-async def _init_neon_pool():
-    global _neon_pool
-    if _neon_pool or not NEON_DSN:
-        return
-    try:
-        _neon_pool = await asyncpg.create_pool(
-            dsn=NEON_DSN,
-            min_size=1,
-            max_size=3,
-            timeout=10,
+async def _init_neon_pool() -> bool:
+    global _neon_pool, _neon_had_failure
+    if not NEON_DSN:
+        error = "DATABASE_URL или NEON_DATABASE_URL не задана"
+        _neon_had_failure = True
+        _set_last_neon_error(error)
+        await _send_db_alert(
+            "neon_not_configured",
+            f"Neon не настроен: {error}. Синхронизация невозможна, пока строка подключения не добавлена в окружение.",
         )
-        _set_last_neon_error("")
-    except Exception as e:
-        _set_last_neon_error(f"{type(e).__name__}: {e}")
-        _neon_pool = None
-        await _send_db_alert("neon_down", "Neon недоступен, работаем в локальном режиме.")
+        return False
+
+    error = None
+    async with _neon_pool_lock:
+        if _neon_pool:
+            return True
+        try:
+            _neon_pool = await asyncpg.create_pool(
+                dsn=NEON_DSN,
+                min_size=1,
+                max_size=3,
+                timeout=15,
+                command_timeout=30,
+            )
+            _set_last_neon_error("")
+            return True
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            _set_last_neon_error(error)
+            _neon_had_failure = True
+            _neon_pool = None
+
+    await _send_db_alert(
+        "neon_down",
+        f"Не удалось подключиться к Neon. Бот продолжает работать локально.\nОшибка: {error}",
+    )
+    return False
 
 
 async def _ensure_neon_schema():
@@ -325,6 +419,14 @@ async def _ensure_neon_schema():
                 last_event_check_ts BIGINT DEFAULT 0,
                 PRIMARY KEY (user_id, cell_idx)
             );
+            CREATE TABLE IF NOT EXISTS month_scores (month_key TEXT, user_id BIGINT, xp_earned BIGINT DEFAULT 0, PRIMARY KEY(month_key,user_id));
+            CREATE TABLE IF NOT EXISTS month_results (month_key TEXT PRIMARY KEY, winner_id BIGINT, second_id BIGINT, third_id BIGINT, finalized_at BIGINT);
+            CREATE TABLE IF NOT EXISTS duel_history (id BIGINT PRIMARY KEY, chat_id BIGINT, player1_id BIGINT, player2_id BIGINT, bet BIGINT, result TEXT, commission_rate INTEGER, created_at BIGINT, resolved_at BIGINT);
+            CREATE TABLE IF NOT EXISTS active_duels (chat_id BIGINT PRIMARY KEY, message_id BIGINT, player1_id BIGINT, player2_id BIGINT, player1_name TEXT, player2_name TEXT, bet BIGINT, state TEXT, player1_choice TEXT, player2_choice TEXT, escrowed INTEGER, created_at BIGINT);
+            CREATE TABLE IF NOT EXISTS factory_orders (id BIGINT PRIMARY KEY, chat_id BIGINT, owner_id BIGINT, order_type TEXT, size TEXT, coin_cost BIGINT, xp_bank BIGINT, topic TEXT, status TEXT, message_id BIGINT, vote_message_id BIGINT, created_at BIGINT, stage_ends_at BIGINT, metadata TEXT, distributed_xp BIGINT DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS factory_order_participants (order_id BIGINT, user_id BIGINT, display_name TEXT, submission_message_id BIGINT, replies_received INTEGER, joined_at BIGINT, PRIMARY KEY(order_id,user_id));
+            CREATE TABLE IF NOT EXISTS factory_order_messages (order_id BIGINT, message_id BIGINT, author_id BIGINT, parent_author_id BIGINT, PRIMARY KEY(order_id,message_id));
+            CREATE TABLE IF NOT EXISTS factory_order_votes (order_id BIGINT, voter_id BIGINT, candidate_id BIGINT, PRIMARY KEY(order_id,voter_id));
             CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
             CREATE INDEX IF NOT EXISTS idx_users_level_xp ON users (level DESC, xp DESC);
             CREATE INDEX IF NOT EXISTS idx_farm_cells_user ON farm_cells (user_id);
@@ -350,6 +452,7 @@ async def _ensure_neon_schema():
         await conn.execute("ALTER TABLE farm_cells ADD COLUMN IF NOT EXISTS status_since BIGINT DEFAULT 0")
         await conn.execute("ALTER TABLE farm_cells ADD COLUMN IF NOT EXISTS last_collect_ts BIGINT DEFAULT 0")
         await conn.execute("ALTER TABLE farm_cells ADD COLUMN IF NOT EXISTS last_event_check_ts BIGINT DEFAULT 0")
+        await conn.execute("ALTER TABLE factory_orders ADD COLUMN IF NOT EXISTS distributed_xp BIGINT DEFAULT 0")
 
 
 async def _count_local_users() -> int:
@@ -383,6 +486,8 @@ async def _fetch_local_table(table: str):
             c = await db.execute("SELECT user_id, coins, opened_cells, moving_from, created_at, updated_at FROM farm_players")
         elif table == "farm_cells":
             c = await db.execute("SELECT user_id, cell_idx, module_type, level, spec, status, status_since, last_collect_ts, last_event_check_ts FROM farm_cells")
+        elif table in EXTRA_SYNC_COLUMNS:
+            c = await db.execute(f"SELECT {','.join(EXTRA_SYNC_COLUMNS[table])} FROM {table}")
         else:
             return []
         return await c.fetchall()
@@ -426,6 +531,10 @@ async def _replace_neon_table_from_local(table: str):
                     "INSERT INTO farm_cells (user_id, cell_idx, module_type, level, spec, status, status_since, last_collect_ts, last_event_check_ts) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
                     rows,
                 )
+            elif table in EXTRA_SYNC_COLUMNS:
+                cols = EXTRA_SYNC_COLUMNS[table]
+                placeholders = ",".join(f"${i}" for i in range(1, len(cols) + 1))
+                await conn.executemany(f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders})", rows)
 
 
 async def _fetch_neon_table(table: str):
@@ -446,6 +555,8 @@ async def _fetch_neon_table(table: str):
             rows = await conn.fetch("SELECT user_id, coins, opened_cells, moving_from, created_at, updated_at FROM farm_players")
         elif table == "farm_cells":
             rows = await conn.fetch("SELECT user_id, cell_idx, module_type, level, spec, status, status_since, last_collect_ts, last_event_check_ts FROM farm_cells")
+        elif table in EXTRA_SYNC_COLUMNS:
+            rows = await conn.fetch(f"SELECT {','.join(EXTRA_SYNC_COLUMNS[table])} FROM {table}")
         else:
             rows = []
         return [tuple(r.values()) for r in rows]
@@ -484,10 +595,15 @@ async def _replace_local_table_from_neon(table: str):
                 "INSERT INTO farm_cells (user_id, cell_idx, module_type, level, spec, status, status_since, last_collect_ts, last_event_check_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
+        elif table in EXTRA_SYNC_COLUMNS and rows:
+            cols = EXTRA_SYNC_COLUMNS[table]
+            placeholders = ",".join("?" for _ in cols)
+            await db.executemany(f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders})", rows)
         await db.commit()
 
 
 async def _sync_dirty_tables_once():
+    global _neon_had_failure
     if not _neon_pool:
         return {"ok": False, "synced": [], "failed_table": None, "error": "Neon не подключен"}
     dirty = await _load_dirty_tables()
@@ -496,14 +612,16 @@ async def _sync_dirty_tables_once():
     synced = []
     failed_table = None
     failure_error = ""
-    for table in list(dirty):
+    for table in sorted(dirty):
         try:
             await _replace_neon_table_from_local(table)
             synced.append(table)
         except Exception as e:
             failed_table = table
             failure_error = f"{type(e).__name__}: {e}"
+            _neon_had_failure = True
             _set_last_neon_error(f"Ошибка синхронизации таблицы {table}: {failure_error}")
+            await _reset_neon_pool()
             await _send_db_alert("sync_failed", f"Ошибка синхронизации таблицы {table} в Neon.\n{failure_error}")
             break
     if synced:
@@ -520,14 +638,128 @@ async def _sync_dirty_tables_once():
     }
 
 
+async def _connect_neon_ready() -> bool:
+    global _neon_had_failure
+    if not await _init_neon_pool():
+        return False
+    try:
+        await _ensure_neon_schema()
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        _neon_had_failure = True
+        _set_last_neon_error(f"Ошибка подготовки схемы Neon: {error}")
+        await _reset_neon_pool()
+        await _send_db_alert(
+            "neon_schema_failed",
+            f"Подключение к Neon открылось, но подготовка схемы завершилась ошибкой.\nОшибка: {error}",
+        )
+        return False
+    return True
+
+
+async def _wake_sync_after(delay_seconds: float):
+    global _retry_wakeup_task
+    try:
+        await asyncio.sleep(max(1, delay_seconds))
+        _sync_wakeup_event.set()
+    finally:
+        _retry_wakeup_task = None
+
+
+def _schedule_retry_wakeup(delay_seconds: float = None):
+    global _retry_wakeup_task
+    delay = SYNC_RETRY_INTERVAL_SECONDS if delay_seconds is None else delay_seconds
+    if _retry_wakeup_task and not _retry_wakeup_task.done():
+        return
+    _retry_wakeup_task = asyncio.create_task(_wake_sync_after(delay))
+
+
+async def _bootstrap_from_neon_if_needed() -> bool:
+    """
+    Treat Neon as the authoritative copy once per process start.
+
+    This protects a newly created or repository-bundled SQLite file on Render
+    from overwriting a newer Neon backup after an instance restart.
+    """
+    global _bootstrap_complete, _neon_had_failure
+    if _bootstrap_complete:
+        return True
+    if not NEON_DSN or os.getenv("DB_STARTUP_BOOTSTRAP_NEON", "1") != "1":
+        _bootstrap_complete = True
+        return True
+    if not await _connect_neon_ready():
+        return False
+
+    recovered_after_failure = _neon_had_failure
+    try:
+        local_users = await _count_local_users()
+        neon_users = await _count_neon_users()
+
+        if neon_users > 0:
+            for table in SYNCABLE_TABLES:
+                await _replace_local_table_from_neon(table)
+            await _clear_dirty(*SYNCABLE_TABLES)
+            await _set_meta_int("local_change_count", 0)
+            await _set_meta_int("sync_activity_count", 0)
+            await _set_meta_int("last_sync_at", int(_now_ts()))
+            _bootstrap_complete = True
+            _neon_had_failure = False
+            _set_last_neon_error("")
+            await _send_db_alert(
+                "local_restore",
+                f"Локальная БД восстановлена из Neon при запуске. Пользователей в backup: {neon_users}.",
+            )
+            return True
+
+        if local_users > 0:
+            await _mark_dirty(*SYNCABLE_TABLES)
+            result = await _sync_dirty_tables_once()
+            if not result["ok"]:
+                return False
+            await _set_meta_int("sync_activity_count", 0)
+            _bootstrap_complete = True
+            _neon_had_failure = False
+            _set_last_neon_error("")
+            await _send_db_alert(
+                "neon_seed",
+                f"Neon был пустой и заполнен из локальной БД при запуске. Пользователей: {local_users}.",
+            )
+            return True
+
+        _bootstrap_complete = True
+        _neon_had_failure = False
+        _set_last_neon_error("")
+        if recovered_after_failure:
+            await _send_db_alert("neon_back", "Соединение с Neon восстановлено.", attach_backup=False)
+        return True
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        _neon_had_failure = True
+        _set_last_neon_error(f"Ошибка startup-восстановления Neon: {error}")
+        await _reset_neon_pool()
+        await _send_db_alert(
+            "neon_bootstrap_failed",
+            f"Не удалось восстановить локальную БД из Neon при запуске.\nОшибка: {error}",
+        )
+        return False
+
+
 async def _sync_loop():
-    global _next_sync_attempt_at, _last_sync_check_at
+    global _next_sync_attempt_at, _last_sync_check_at, _neon_had_failure
     while True:
         # Strict event-driven mode: check sync only after local writes.
         await _sync_wakeup_event.wait()
         _sync_wakeup_event.clear()
 
         now = _now_ts()
+        if not _bootstrap_complete:
+            async with _sync_execution_lock:
+                bootstrapped = await _bootstrap_from_neon_if_needed()
+            if not bootstrapped:
+                _next_sync_attempt_at = now + SYNC_RETRY_INTERVAL_SECONDS
+                _schedule_retry_wakeup()
+                continue
+
         if SYNC_CHECK_INTERVAL_SECONDS > 0 and _last_sync_check_at and (now - _last_sync_check_at) < SYNC_CHECK_INTERVAL_SECONDS:
             continue
         _last_sync_check_at = now
@@ -537,9 +769,9 @@ async def _sync_loop():
             continue
 
         if now < _next_sync_attempt_at:
+            _schedule_retry_wakeup(_next_sync_attempt_at - now)
             continue
 
-        local_changes = await _get_meta_int("local_change_count", 0)
         activity_messages = await _get_meta_int("sync_activity_count", 0)
         last_sync_at = await _get_meta_int("last_sync_at", 0)
         min_interval_ok = (last_sync_at == 0) or (now - last_sync_at >= SYNC_MIN_INTERVAL_SECONDS)
@@ -549,26 +781,41 @@ async def _sync_loop():
         if activity_messages < SYNC_MIN_ACTIVITY_MESSAGES:
             continue
 
-        was_disconnected = _neon_pool is None
-        if not _neon_pool:
-            await _init_neon_pool()
-            if not _neon_pool:
-                _next_sync_attempt_at = now + SYNC_RETRY_INTERVAL_SECONDS
-                continue
-            await _ensure_neon_schema()
-            if was_disconnected:
-                await _send_db_alert("neon_back", "Neon снова доступен, синхронизация возобновлена.")
         try:
-            result = await _sync_dirty_tables_once()
-            if result["ok"]:
-                await _set_meta_int("sync_activity_count", 0)
-            _next_sync_attempt_at = now + (SYNC_MIN_INTERVAL_SECONDS if result["ok"] else SYNC_RETRY_INTERVAL_SECONDS)
-        except Exception:
+            async with _sync_execution_lock:
+                if not await _connect_neon_ready():
+                    _next_sync_attempt_at = now + SYNC_RETRY_INTERVAL_SECONDS
+                    _schedule_retry_wakeup()
+                    continue
+
+                result = await _sync_dirty_tables_once()
+                if result["ok"]:
+                    _neon_had_failure = False
+                    await _set_meta_int("sync_activity_count", 0)
+                    _next_sync_attempt_at = now + SYNC_MIN_INTERVAL_SECONDS
+                    if result["synced"]:
+                        synced_list = ", ".join(result["synced"])
+                        await _send_db_alert(
+                            "sync_success",
+                            f"Neon успешно синхронизирован. Таблицы: {synced_list}.",
+                        )
+                else:
+                    _next_sync_attempt_at = now + SYNC_RETRY_INTERVAL_SECONDS
+                    _schedule_retry_wakeup()
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            _set_last_neon_error(f"Необработанная ошибка sync-цикла: {error}")
+            await _reset_neon_pool()
+            await _send_db_alert(
+                "sync_loop_failed",
+                f"Необработанная ошибка синхронизации Neon.\nОшибка: {error}",
+            )
             _next_sync_attempt_at = now + SYNC_RETRY_INTERVAL_SECONDS
+            _schedule_retry_wakeup()
 
 
 async def _startup_bootstrap():
-    global _startup_sync_done, _sync_task
+    global _startup_sync_done, _sync_task, _next_sync_attempt_at, _bootstrap_complete
     if _startup_sync_done:
         return
     _startup_sync_done = True
@@ -576,28 +823,15 @@ async def _startup_bootstrap():
     if not _sync_task:
         _sync_task = asyncio.create_task(_sync_loop())
 
-    # By default do not touch Neon on startup to preserve free-tier compute hours.
-    # Enable old bootstrap behavior only if explicitly requested.
-    if os.getenv("DB_STARTUP_BOOTSTRAP_NEON", "0") != "1":
+    if not NEON_DSN or os.getenv("DB_STARTUP_BOOTSTRAP_NEON", "1") != "1":
+        _bootstrap_complete = True
         return
 
-    await _init_neon_pool()
-    if not _neon_pool:
-        return
-    await _ensure_neon_schema()
-
-    local_users = await _count_local_users()
-    neon_users = await _count_neon_users()
-
-    if local_users == 0 and neon_users > 0:
-        for t in SYNCABLE_TABLES:
-            await _replace_local_table_from_neon(t)
-        await _clear_dirty(*SYNCABLE_TABLES)
-        await _send_db_alert("local_restore", "Локальная БД была пустая, данные подтянуты из Neon.")
-    elif local_users > 0 and neon_users == 0:
-        await _mark_dirty(*SYNCABLE_TABLES)
-        await _sync_dirty_tables_once()
-        await _send_db_alert("neon_seed", "Neon был пустой, выполнен первичный экспорт из локальной БД.")
+    async with _sync_execution_lock:
+        bootstrapped = await _bootstrap_from_neon_if_needed()
+    if not bootstrapped:
+        _next_sync_attempt_at = _now_ts() + SYNC_RETRY_INTERVAL_SECONDS
+        _schedule_retry_wakeup()
 
 async def create_tables():
     async with aiosqlite.connect(DB_NAME) as db:
@@ -663,10 +897,20 @@ async def create_tables():
         await db.execute('CREATE TABLE IF NOT EXISTS whitelist (item TEXT PRIMARY KEY)')
         await db.execute('CREATE TABLE IF NOT EXISTS badwords (word TEXT PRIMARY KEY)')
         await db.execute('''CREATE TABLE IF NOT EXISTS warn_reasons (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            user_id INTEGER, 
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             reason TEXT
         )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS recent_user_messages (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            deleted_at INTEGER,
+            PRIMARY KEY (chat_id, message_id)
+        )''')
+        await db.execute('''CREATE INDEX IF NOT EXISTS idx_recent_user_messages_lookup
+            ON recent_user_messages (chat_id, user_id, created_at DESC)''')
         await db.execute('''CREATE TABLE IF NOT EXISTS sync_meta (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -692,9 +936,98 @@ async def create_tables():
             PRIMARY KEY (user_id, cell_idx)
         )''')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_farm_cells_user ON farm_cells (user_id)')
+
+        # Долгоживущая прогрессия и социальные события. Все таблицы добавляются
+        # отдельно: старые users/farm_* не переписываются и накопления не теряются.
+        await db.execute('''CREATE TABLE IF NOT EXISTS month_scores (
+            month_key TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            xp_earned INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (month_key, user_id)
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS month_results (
+            month_key TEXT PRIMARY KEY,
+            winner_id INTEGER,
+            second_id INTEGER,
+            third_id INTEGER,
+            finalized_at INTEGER NOT NULL
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS duel_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            player1_id INTEGER NOT NULL,
+            player2_id INTEGER NOT NULL,
+            bet INTEGER NOT NULL,
+            result TEXT NOT NULL,
+            commission_rate INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            resolved_at INTEGER NOT NULL
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS active_duels (
+            chat_id INTEGER PRIMARY KEY,
+            message_id INTEGER DEFAULT 0,
+            player1_id INTEGER NOT NULL,
+            player2_id INTEGER NOT NULL,
+            player1_name TEXT NOT NULL,
+            player2_name TEXT NOT NULL,
+            bet INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            player1_choice TEXT,
+            player2_choice TEXT,
+            escrowed INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS factory_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            order_type TEXT NOT NULL,
+            size TEXT NOT NULL,
+            coin_cost INTEGER NOT NULL,
+            xp_bank INTEGER NOT NULL,
+            topic TEXT DEFAULT '',
+            status TEXT NOT NULL,
+            message_id INTEGER DEFAULT 0,
+            vote_message_id INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            stage_ends_at INTEGER NOT NULL,
+            metadata TEXT DEFAULT '{}'
+            ,distributed_xp INTEGER DEFAULT 0
+        )''')
+        try:
+            await db.execute("ALTER TABLE factory_orders ADD COLUMN distributed_xp INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        await db.execute('''CREATE TABLE IF NOT EXISTS factory_order_participants (
+            order_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            display_name TEXT NOT NULL,
+            submission_message_id INTEGER DEFAULT 0,
+            replies_received INTEGER DEFAULT 0,
+            joined_at INTEGER NOT NULL,
+            PRIMARY KEY (order_id, user_id)
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS factory_order_messages (
+            order_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            author_id INTEGER NOT NULL,
+            parent_author_id INTEGER,
+            PRIMARY KEY (order_id, message_id)
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS factory_order_votes (
+            order_id INTEGER NOT NULL,
+            voter_id INTEGER NOT NULL,
+            candidate_id INTEGER NOT NULL,
+            PRIMARY KEY (order_id, voter_id)
+        )''')
+        await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_factory_one_active_chat ON factory_orders(chat_id) WHERE status IN (\'active\', \'voting\', \'tournament\')')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_duel_pair_day ON duel_history(player1_id, player2_id, resolved_at)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_month_score_rank ON month_scores(month_key, xp_earned DESC)')
         
         await db.commit()
     await _startup_bootstrap()
+    await finalize_closed_months()
+    await refund_interrupted_duels()
 
 async def get_user(user_id, username=None, full_name=None):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -735,8 +1068,65 @@ async def get_id_by_username(username: str):
         row = await cursor.fetchone()
         return row[0] if row else None
 
-async def update_xp(user_id, xp_amount):
+
+async def track_recent_message(chat_id: int, user_id: int, message_id: int, created_at: int = None):
+    """Remember a message so moderators can later clear a user's recent history."""
+    timestamp = int(created_at or time.time())
+    cutoff = timestamp - (48 * 60 * 60)
     async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            '''INSERT OR IGNORE INTO recent_user_messages
+               (chat_id, user_id, message_id, created_at, deleted_at)
+               VALUES (?, ?, ?, ?, NULL)''',
+            (chat_id, user_id, message_id, timestamp),
+        )
+        await db.execute('DELETE FROM recent_user_messages WHERE created_at < ?', (cutoff,))
+        await db.commit()
+
+
+async def get_recent_message_ids(
+    chat_id: int,
+    user_id: int,
+    limit: int,
+    within_seconds: int = 48 * 60 * 60,
+):
+    safe_limit = max(1, min(int(limit), 100))
+    cutoff = int(time.time()) - max(1, int(within_seconds))
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            '''SELECT message_id
+               FROM recent_user_messages
+               WHERE chat_id = ? AND user_id = ?
+                 AND deleted_at IS NULL AND created_at >= ?
+               ORDER BY created_at DESC, message_id DESC
+               LIMIT ?''',
+            (chat_id, user_id, cutoff, safe_limit),
+        )
+        return [row[0] for row in await cursor.fetchall()]
+
+
+async def mark_recent_messages_deleted(chat_id: int, message_ids):
+    ids = [int(message_id) for message_id in message_ids]
+    if not ids:
+        return
+    placeholders = ','.join('?' for _ in ids)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            f'''UPDATE recent_user_messages
+                SET deleted_at = ?
+                WHERE chat_id = ? AND message_id IN ({placeholders})''',
+            (int(time.time()), chat_id, *ids),
+        )
+        await db.commit()
+
+def total_available_xp(xp: int, level: int) -> int:
+    """XP that can actually be lost, including completed level bars."""
+    return max(0, int(xp)) + sum(int(LEVEL_CAPS[lvl]) for lvl in range(1, max(1, int(level))))
+
+
+async def update_xp(user_id, xp_amount, count_monthly=False, month_key=None):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
         cursor = await db.execute('SELECT xp, level FROM users WHERE user_id = ?', (user_id,))
         row = await cursor.fetchone()
         if not row: return (0, 0, 0)
@@ -762,8 +1152,14 @@ async def update_xp(user_id, xp_amount):
             cap = LEVEL_CAPS.get(current_lvl, float('inf'))
             
         await db.execute('UPDATE users SET xp = ?, level = ? WHERE user_id = ?', (new_xp, current_lvl, user_id))
+        if count_monthly and xp_amount > 0:
+            key = month_key or datetime.now().strftime("%Y-%m")
+            await db.execute('''
+                INSERT INTO month_scores(month_key, user_id, xp_earned) VALUES (?, ?, ?)
+                ON CONFLICT(month_key, user_id) DO UPDATE SET xp_earned = xp_earned + excluded.xp_earned
+            ''', (key, user_id, int(xp_amount)))
         await db.commit()
-        await _mark_dirty("users")
+        await _mark_dirty("users", *( ["month_scores"] if count_monthly and xp_amount > 0 else [] ))
         return (old_lvl, current_lvl, xp_amount)
 
 async def give_reputation(from_user_id, to_user_id):
@@ -773,6 +1169,7 @@ async def give_reputation(from_user_id, to_user_id):
     today = datetime.now().strftime("%Y-%m-%d")
     
     async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
         cursor = await db.execute('SELECT 1 FROM rep_history WHERE from_id = ? AND to_id = ? AND date_str = ?', 
                                   (from_user_id, to_user_id, today))
         if await cursor.fetchone():
@@ -784,13 +1181,266 @@ async def give_reputation(from_user_id, to_user_id):
         if count and count[0] >= 3:
             return "daily_limit_total"
 
+        since = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        cursor = await db.execute('''SELECT 1 FROM rep_history
+            WHERE from_id = ? AND to_id = ? AND date_str >= ? LIMIT 1''',
+                                  (from_user_id, to_user_id, since))
+        repeated = bool(await cursor.fetchone())
+
         await db.execute('INSERT INTO rep_history (from_id, to_id, date_str) VALUES (?, ?, ?)',
                          (from_user_id, to_user_id, today))
         await db.execute('UPDATE users SET reputation = reputation + 1 WHERE user_id = ?', (to_user_id,))
         await db.commit()
         await _mark_dirty("rep_history", "users")
         
-        return "success"
+        return "success_repeat" if repeated else "success_full"
+
+
+def _previous_month_key(now=None):
+    now = now or datetime.now()
+    first = now.replace(day=1)
+    return (first - timedelta(days=1)).strftime("%Y-%m")
+
+
+async def get_month_score(user_id: int, month_key=None):
+    key = month_key or datetime.now().strftime("%Y-%m")
+    async with aiosqlite.connect(DB_NAME) as db:
+        row = await (await db.execute(
+            "SELECT xp_earned FROM month_scores WHERE month_key=? AND user_id=?", (key, user_id)
+        )).fetchone()
+        score = int(row[0]) if row else 0
+        rank_row = await (await db.execute('''SELECT 1 + COUNT(*) FROM month_scores
+            WHERE month_key=? AND xp_earned > ?''', (key, score))).fetchone()
+        return score, int(rank_row[0]) if rank_row and score > 0 else None
+
+
+async def get_month_leaders(limit=10, month_key=None):
+    key = month_key or datetime.now().strftime("%Y-%m")
+    async with aiosqlite.connect(DB_NAME) as db:
+        c = await db.execute('''SELECT COALESCE(u.full_name, 'Игрок'), s.xp_earned, s.user_id
+            FROM month_scores s LEFT JOIN users u ON u.user_id=s.user_id
+            WHERE s.month_key=? ORDER BY s.xp_earned DESC, s.user_id ASC LIMIT ?''', (key, limit))
+        return await c.fetchall()
+
+
+async def get_month_wins(user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        row = await (await db.execute(
+            "SELECT COUNT(*) FROM month_results WHERE winner_id=?", (user_id,)
+        )).fetchone()
+        last = await (await db.execute('''SELECT month_key FROM month_results
+            WHERE winner_id=? ORDER BY month_key DESC LIMIT 1''', (user_id,))).fetchone()
+        return int(row[0] or 0), (last[0] if last else None)
+
+
+async def finalize_closed_months(now=None):
+    """Finalize every scored month before the current one exactly once."""
+    now = now or datetime.now()
+    current_key = now.strftime("%Y-%m")
+    async with _month_finalize_lock:
+        async with aiosqlite.connect(DB_NAME) as db:
+            rows = await (await db.execute(
+                "SELECT DISTINCT month_key FROM month_scores WHERE month_key < ? ORDER BY month_key", (current_key,)
+            )).fetchall()
+        for (key,) in rows:
+            async with aiosqlite.connect(DB_NAME) as db:
+                exists = await (await db.execute(
+                    "SELECT 1 FROM month_results WHERE month_key=?", (key,)
+                )).fetchone()
+                if exists:
+                    continue
+                leaders = await (await db.execute('''SELECT user_id FROM month_scores
+                    WHERE month_key=? ORDER BY xp_earned DESC, user_id ASC LIMIT 3''', (key,))).fetchall()
+                ids = [int(r[0]) for r in leaders]
+                for idx, uid in enumerate(ids):
+                    row = await (await db.execute("SELECT xp, level FROM users WHERE user_id=?", (uid,))).fetchone()
+                    if not row:
+                        continue
+                    xp, lvl = int(row[0]), int(row[1])
+                    amount = MONTH_PRIZES[idx]
+                    new_xp = xp + amount
+                    while lvl < 5 and new_xp >= LEVEL_CAPS[lvl]:
+                        new_xp -= int(LEVEL_CAPS[lvl]); lvl += 1
+                    await db.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (new_xp, lvl, uid))
+                padded = ids + [None] * (3 - len(ids))
+                await db.execute('''INSERT INTO month_results
+                    (month_key,winner_id,second_id,third_id,finalized_at) VALUES(?,?,?,?,?)''',
+                    (key, padded[0], padded[1], padded[2], int(time.time())))
+                await db.commit()
+            await _mark_dirty("users", "month_results")
+
+
+async def _month_processor():
+    while True:
+        try:
+            await finalize_closed_months()
+        except Exception:
+            logging.exception("Ошибка завершения месячного рейтинга")
+        await asyncio.sleep(300)
+
+
+def start_month_processor():
+    global _month_processor_task
+    if not _month_processor_task or _month_processor_task.done():
+        _month_processor_task = asyncio.create_task(_month_processor())
+
+
+async def get_previous_month_title():
+    key = _previous_month_key()
+    async with aiosqlite.connect(DB_NAME) as db:
+        row = await (await db.execute('''SELECT r.winner_id, COALESCE(u.full_name,'Игрок')
+            FROM month_results r LEFT JOIN users u ON u.user_id=r.winner_id WHERE r.month_key=?''', (key,))).fetchone()
+        return (key, row[0], row[1]) if row and row[0] else None
+
+
+async def save_active_duel(duel: dict):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''INSERT OR REPLACE INTO active_duels
+            (chat_id,message_id,player1_id,player2_id,player1_name,player2_name,bet,state,
+             player1_choice,player2_choice,escrowed,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (duel["chat_id"], duel.get("message_id", 0), duel["initiator"], duel["target"],
+             duel["initiator_name"], duel["target_name"], duel["bet"], duel["state"],
+             duel.get("p1_choice"), duel.get("p2_choice"), int(duel.get("escrowed", False)),
+             duel.get("created_at", int(time.time()))))
+        await db.commit()
+    await _mark_dirty("active_duels")
+
+
+async def load_active_duel(chat_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        row = await (await db.execute("SELECT * FROM active_duels WHERE chat_id=?", (chat_id,))).fetchone()
+    if not row:
+        return None
+    return {"chat_id": row[0], "message_id": row[1], "initiator": row[2], "target": row[3],
+            "initiator_name": row[4], "target_name": row[5], "bet": row[6], "state": row[7],
+            "p1_choice": row[8], "p2_choice": row[9], "escrowed": bool(row[10]), "created_at": row[11]}
+
+
+async def escrow_active_duel(chat_id: int) -> bool:
+    """Atomically deduct both stakes and move a waiting duel to fighting."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        duel = await (await db.execute('''SELECT player1_id,player2_id,bet,state
+            FROM active_duels WHERE chat_id=?''', (chat_id,))).fetchone()
+        if not duel or duel[3] != "waiting_accept":
+            await db.rollback(); return False
+        balances = []
+        for uid in duel[:2]:
+            row = await (await db.execute("SELECT xp,level FROM users WHERE user_id=?", (uid,))).fetchone()
+            if not row or total_available_xp(row[0], row[1]) < int(duel[2]):
+                await db.rollback(); return False
+            xp, lvl = int(row[0]) - int(duel[2]), int(row[1])
+            while xp < 0 and lvl > 1:
+                lvl -= 1; xp += int(LEVEL_CAPS[lvl])
+            if xp < 0:
+                await db.rollback(); return False
+            balances.append((xp, lvl, uid))
+        await db.executemany("UPDATE users SET xp=?,level=? WHERE user_id=?", balances)
+        await db.execute("UPDATE active_duels SET state='fighting',escrowed=1 WHERE chat_id=?", (chat_id,))
+        await db.commit()
+    await _mark_dirty("users", "active_duels")
+    return True
+
+
+async def delete_active_duel(chat_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM active_duels WHERE chat_id=?", (chat_id,)); await db.commit()
+    await _mark_dirty("active_duels")
+
+
+async def refund_interrupted_duels():
+    """A restart can invalidate old buttons; escrow is therefore returned safely."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        rows = await (await db.execute(
+            "SELECT player1_id,player2_id,bet FROM active_duels WHERE escrowed=1")).fetchall()
+        for p1, p2, bet in rows:
+            for uid in (p1, p2):
+                state = await (await db.execute("SELECT xp,level FROM users WHERE user_id=?", (uid,))).fetchone()
+                if not state: continue
+                xp, lvl = int(state[0]) + int(bet), int(state[1])
+                while lvl < 5 and xp >= LEVEL_CAPS[lvl]: xp -= int(LEVEL_CAPS[lvl]); lvl += 1
+                await db.execute("UPDATE users SET xp=?,level=? WHERE user_id=?", (xp, lvl, uid))
+        await db.execute("DELETE FROM active_duels"); await db.commit()
+    if rows:
+        await _mark_dirty("active_duels", "users")
+
+
+async def expire_stale_duels(max_age_seconds=900):
+    cutoff = int(time.time()) - int(max_age_seconds)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        rows = await (await db.execute('''SELECT chat_id,player1_id,player2_id,bet,escrowed
+            FROM active_duels WHERE created_at<=?''', (cutoff,))).fetchall()
+        for _chat, p1, p2, bet, escrowed in rows:
+            if not escrowed: continue
+            for uid in (p1, p2):
+                state = await (await db.execute("SELECT xp,level FROM users WHERE user_id=?", (uid,))).fetchone()
+                if not state: continue
+                xp, lvl = int(state[0]) + int(bet), int(state[1])
+                while lvl < 5 and xp >= LEVEL_CAPS[lvl]: xp -= int(LEVEL_CAPS[lvl]); lvl += 1
+                await db.execute("UPDATE users SET xp=?,level=? WHERE user_id=?", (xp, lvl, uid))
+        if rows:
+            await db.executemany("DELETE FROM active_duels WHERE chat_id=?", [(r[0],) for r in rows])
+        await db.commit()
+    if rows:
+        await _mark_dirty("active_duels", "users")
+    return [(int(r[0]), bool(r[4])) for r in rows]
+
+
+async def duel_pair_count_today(player1_id: int, player2_id: int) -> int:
+    start = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    a, b = sorted((player1_id, player2_id))
+    async with aiosqlite.connect(DB_NAME) as db:
+        row = await (await db.execute('''SELECT COUNT(*) FROM duel_history
+            WHERE MIN(player1_id,player2_id)=? AND MAX(player1_id,player2_id)=?
+              AND resolved_at>=? AND result!='draw' ''', (a, b, start))).fetchone()
+        return int(row[0] or 0)
+
+
+async def record_duel(duel: dict, result: str, commission_rate: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''INSERT INTO duel_history
+            (chat_id,player1_id,player2_id,bet,result,commission_rate,created_at,resolved_at)
+            VALUES(?,?,?,?,?,?,?,?)''', (duel["chat_id"], duel["initiator"], duel["target"], duel["bet"],
+            result, commission_rate, duel.get("created_at", int(time.time())), int(time.time())))
+        await db.execute("DELETE FROM active_duels WHERE chat_id=?", (duel["chat_id"],))
+        await db.commit()
+    await _mark_dirty("duel_history", "active_duels")
+
+
+async def settle_active_duel(duel: dict, winner_id=None, commission_rate=0):
+    """Atomically pay/refund an escrowed duel and close it."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row = await (await db.execute("SELECT escrowed FROM active_duels WHERE chat_id=?", (duel["chat_id"],))).fetchone()
+        if not row or not int(row[0]):
+            await db.rollback(); return None
+        bet = int(duel["bet"])
+        awards = ({duel["initiator"]: bet, duel["target"]: bet} if winner_id is None
+                  else {int(winner_id): bet * 2 * (100 - int(commission_rate)) // 100})
+        for uid, amount in awards.items():
+            state = await (await db.execute("SELECT xp,level FROM users WHERE user_id=?", (uid,))).fetchone()
+            if not state: continue
+            xp, lvl = int(state[0]) + int(amount), int(state[1])
+            while lvl < 5 and xp >= LEVEL_CAPS[lvl]: xp -= int(LEVEL_CAPS[lvl]); lvl += 1
+            await db.execute("UPDATE users SET xp=?,level=? WHERE user_id=?", (xp, lvl, uid))
+        result = "draw" if winner_id is None else str(winner_id)
+        await db.execute('''INSERT INTO duel_history
+            (chat_id,player1_id,player2_id,bet,result,commission_rate,created_at,resolved_at)
+            VALUES(?,?,?,?,?,?,?,?)''', (duel["chat_id"], duel["initiator"], duel["target"], bet,
+            result, int(commission_rate), duel.get("created_at", int(time.time())), int(time.time())))
+        await db.execute("DELETE FROM active_duels WHERE chat_id=?", (duel["chat_id"],))
+        await db.commit()
+    await _mark_dirty("users", "duel_history", "active_duels")
+    return sum(awards.values()) if winner_id is not None else 0
+
+
+async def farm_is_complete(user_id: int) -> bool:
+    state = await farm_get_state(user_id)
+    return (len(state.get("opened_cells", [])) == FARM_CELLS_TOTAL
+            and len(state.get("cells", [])) == FARM_CELLS_TOTAL
+            and all(int(c.get("level", 0)) >= 3 for c in state.get("cells", [])))
 
 async def check_wipe_cooldown(user_id):
     today = datetime.now().strftime("%Y-%m-%d")
@@ -935,6 +1585,7 @@ async def get_db_sync_status():
         "db_path": DB_NAME,
         "neon_configured": bool(NEON_DSN),
         "neon_connected": _neon_pool is not None,
+        "bootstrap_complete": _bootstrap_complete,
         "sync_loop_running": _sync_task is not None and not _sync_task.done(),
         "dirty_tables": dirty,
         "local_change_count": local_changes,
@@ -955,35 +1606,52 @@ async def trigger_manual_sync():
     Force one sync attempt now (ignores schedule thresholds).
     Returns dict with result status for UI.
     """
-    global _next_sync_attempt_at
-    dirty = await _load_dirty_tables()
-    if not dirty:
-        return {"ok": True, "message": "Синхронизация не нужна: изменений нет."}
-
-    await _init_neon_pool()
-    if not _neon_pool:
-        _next_sync_attempt_at = _now_ts() + SYNC_RETRY_INTERVAL_SECONDS
-        details = _last_neon_error or "причина не зафиксирована"
-        return {"ok": False, "message": f"Neon недоступен, ручной sync не выполнен.\nДетали: {details}"}
-
+    global _next_sync_attempt_at, _neon_had_failure
     try:
-        await _ensure_neon_schema()
-        result = await _sync_dirty_tables_once()
+        async with _sync_execution_lock:
+            if not await _bootstrap_from_neon_if_needed():
+                _next_sync_attempt_at = _now_ts() + SYNC_RETRY_INTERVAL_SECONDS
+                _schedule_retry_wakeup()
+                details = _last_neon_error or "причина не зафиксирована"
+                return {"ok": False, "message": f"Startup-восстановление Neon не завершено.\nДетали: {details}"}
+
+            dirty = await _load_dirty_tables()
+            if not dirty:
+                return {"ok": True, "message": "Синхронизация не нужна: изменений нет."}
+
+            if not await _connect_neon_ready():
+                _next_sync_attempt_at = _now_ts() + SYNC_RETRY_INTERVAL_SECONDS
+                _schedule_retry_wakeup()
+                details = _last_neon_error or "причина не зафиксирована"
+                return {"ok": False, "message": f"Neon недоступен, ручной sync не выполнен.\nДетали: {details}"}
+
+            result = await _sync_dirty_tables_once()
         if result["ok"]:
             await _set_meta_int("sync_activity_count", 0)
             _next_sync_attempt_at = _now_ts() + SYNC_MIN_INTERVAL_SECONDS
             if result["synced"]:
                 synced_list = ", ".join(result["synced"])
+                _neon_had_failure = False
+                await _send_db_alert(
+                    "manual_sync_success",
+                    f"Ручная синхронизация Neon выполнена. Таблицы: {synced_list}.",
+                )
                 return {"ok": True, "message": f"Ручная синхронизация выполнена успешно.\nСинхронизировано таблиц: {synced_list}"}
             return {"ok": True, "message": "Изменения уже были синхронизированы, новых таблиц не найдено."}
 
         _next_sync_attempt_at = _now_ts() + SYNC_RETRY_INTERVAL_SECONDS
+        _schedule_retry_wakeup()
         table = result["failed_table"] or "неизвестно"
         details = result["error"] or "причина не зафиксирована"
         return {"ok": False, "message": f"Ошибка ручного sync таблицы {table}.\nДетали: {details}"}
     except Exception as e:
-        _set_last_neon_error(f"{type(e).__name__}: {e}")
+        error = f"{type(e).__name__}: {e}"
+        _neon_had_failure = True
+        _set_last_neon_error(error)
+        await _reset_neon_pool()
+        await _send_db_alert("manual_sync_failed", f"Ошибка ручного sync Neon.\nОшибка: {error}")
         _next_sync_attempt_at = _now_ts() + SYNC_RETRY_INTERVAL_SECONDS
+        _schedule_retry_wakeup()
         return {"ok": False, "message": f"Ошибка ручного sync: {e}"}
 
 
@@ -1011,10 +1679,14 @@ async def import_local_db_from_file(uploaded_db_path: str):
     Imports SQLite DB from uploaded file into the active local DB.
     Then marks syncable tables dirty and immediately tries one Neon sync.
     """
+    global _bootstrap_complete
     async with _db_import_lock:
         await asyncio.to_thread(_validate_sqlite_file_sync, uploaded_db_path)
         await asyncio.to_thread(_replace_local_db_sync, uploaded_db_path)
         await create_tables()
+        # A file explicitly uploaded by the owner is authoritative and should
+        # be pushed to Neon instead of being overwritten by startup restore.
+        _bootstrap_complete = True
         await _mark_dirty(*SYNCABLE_TABLES)
         sync_result = await trigger_manual_sync()
         return {
@@ -1350,6 +2022,21 @@ async def farm_adjust_coins(user_id: int, delta: int):
         await db.commit()
     await _mark_dirty("farm_players")
     return new_coins
+
+
+async def farm_spend_coins(user_id: int, amount: int) -> bool:
+    """Atomic factory purchase; unlike adjustment it never clamps or overspends."""
+    await _farm_get_or_create_player(user_id)
+    amount = max(0, int(amount))
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute('''UPDATE farm_players SET coins=coins-?, updated_at=?
+            WHERE user_id=? AND coins>=?''', (amount, _farm_now(), user_id, amount))
+        ok = cur.rowcount == 1
+        await db.commit()
+    if ok:
+        await _mark_dirty("farm_players")
+    return ok
 
 
 def _farm_module_sell_refund(module_type: str, level: int, spec: str):

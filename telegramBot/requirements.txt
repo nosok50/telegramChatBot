@@ -2,3 +2,4 @@ aiogram>=3.0.0
 aiosqlite
 asyncpg
 flask
+python-dotenv

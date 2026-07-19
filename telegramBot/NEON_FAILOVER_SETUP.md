@@ -1,33 +1,26 @@
 ## Neon failover setup
 
-### 1) Required env
-- Необязателен: строка Neon уже встроена в код.
-- Если нужно переопределить: `DATABASE_URL`.
+The project reads the Neon connection string only from the environment:
 
-### 2) Optional env
-- DB-уведомления теперь всегда идут на `OWNER_ID` из `config.py`.
-- `DB_SYNC_CHECK_INTERVAL` = local check interval in seconds. Default: `120`.
-- `DB_SYNC_MIN_INTERVAL` = minimum pause between successful syncs. Default: `18000` (5h).
-- `DB_SYNC_RETRY_INTERVAL` = retry pause after failed sync. Default: `600`.
-- `DB_SYNC_MIN_LOCAL_CHANGES` = minimum local changes before sync. Default: `120`.
-- `DB_SYNC_MAX_DIRTY_AGE` = force sync if dirty too long. Default: `604800`.
-
-### 3) Local test in PowerShell
-```powershell
-$env:DATABASE_URL="postgresql://...neon.tech/..."
-$env:DB_SYNC_MIN_INTERVAL="18000"
-$env:DB_SYNC_MIN_LOCAL_CHANGES="120"
-py -3 main.py
+```text
+DATABASE_URL=postgresql://USER:PASSWORD@HOST/DATABASE?sslmode=require
 ```
 
-### 4) Behavior summary
-- Bot always works with local SQLite runtime.
-- If Neon is available, dirty tables are synced in background.
-- If Neon is down, bot continues locally.
-- If local DB is empty on startup and Neon has data, local DB is restored from Neon.
-- If Neon is empty and local has data, Neon is seeded from local.
-- Alerts are sent to your Telegram for DB events (if alert target is configured).
+`NEON_DATABASE_URL` may be used as an alternative name. Do not place a real
+connection string in this repository, documentation, source files, or commits.
 
-### 5) Status command
-- Owner command: `/dbstatus`
-- Shows current DB mode, dirty tables, counters, timers and alert target.
+### Local testing
+
+The local `.env` deliberately has no database URL. The test bot therefore uses
+the isolated SQLite file configured by `DB_PATH`.
+
+### Render
+
+Set `DATABASE_URL` (and `BOT_TOKEN`) in the Render service environment, then
+redeploy. Do not use a connection string stored in the repository.
+
+### Behaviour
+
+- Neon is optional; the bot can continue with its local SQLite data if Neon is unavailable.
+- Startup sync is disabled by default to preserve free-tier compute time.
+- Sync behaviour can be tuned with the `DB_SYNC_*` variables in `database.py`.
