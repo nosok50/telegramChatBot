@@ -9,9 +9,10 @@ from aiogram.types import BotCommandScopeDefault
 from config import BOT_TOKEN, COMMANDS
 from database import create_tables, DB_NAME, start_month_processor
 from engagement import create_engagement_tables
+from level_tags import start_level_tag_processor
 
 # Импорт модулей
-from modules import admin, moderation, user, games, factory_orders
+from modules import admin, admin_factory, moderation, user, games, factory_orders
 
 # Импорт функции для Render
 from keep_alive import keep_alive 
@@ -36,6 +37,7 @@ async def main():
 
     # Регистрация роутеров
     dp.include_router(admin.router)
+    dp.include_router(admin_factory.router)
     dp.include_router(moderation.router)
     dp.include_router(factory_orders.router)
     dp.include_router(user.router)
@@ -45,6 +47,7 @@ async def main():
     factory_orders.start_factory_processor(bot)
     games.start_duel_processor(bot)
     start_month_processor()
+    start_level_tag_processor(bot)
 
     print("Бот запущен. Система уровней 2.0 активирована.")
     await bot.delete_webhook(drop_pending_updates=True)

@@ -11,6 +11,7 @@ from database import (
     get_month_score, get_month_leaders, get_month_wins, get_previous_month_title,
 )
 from engagement import process_chat_activity
+from level_tags import ensure_level_tag
 from modules.factory_orders import track_text_message, track_media_message, get_factory_order_stats
 from config import WARN_LIMIT, OWNER_ID
 from utils import (
@@ -802,6 +803,7 @@ async def text_handler(message: types.Message):
 
     if not message.from_user:
         return
+    await ensure_level_tag(message)
     
     user_id = message.from_user.id
     text = message.text
@@ -875,6 +877,7 @@ async def media_handler(message: types.Message):
 
     if not message.from_user:
         return
+    await ensure_level_tag(message)
     
     result = await process_chat_activity(message, is_media=True)
     await track_media_message(message)

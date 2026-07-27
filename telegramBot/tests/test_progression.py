@@ -1,14 +1,61 @@
 import os
+import json
+import sqlite3
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import aiosqlite
 
 import database
 import engagement
-from modules import factory_orders
+import level_tags
+from modules import admin_factory, factory_orders
+
+
+class FakeSentMessage:
+    def __init__(self, message_id):
+        self.message_id = message_id
+        self.deleted = False
+
+    async def delete(self):
+        self.deleted = True
+
+
+class FakeFactoryBot:
+    def __init__(self):
+        self.next_message_id = 100
+        self.sent = []
+        self.deleted = []
+
+    async def send_message(self, chat_id, text, reply_markup=None, **_kwargs):
+        message = FakeSentMessage(self.next_message_id)
+        self.next_message_id += 1
+        self.sent.append((int(chat_id), text, reply_markup, message))
+        return message
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((int(chat_id), int(message_id)))
+
+    async def get_chat(self, chat_id):
+        return SimpleNamespace(title=f"Group {chat_id}", full_name=None)
+
+
+class FakeCallback:
+    def __init__(self, bot, data, user_id, message_id=0):
+        self.bot = bot
+        self.data = data
+        self.from_user = SimpleNamespace(
+            id=user_id,
+            username=f"u{user_id}",
+            full_name=f"User {user_id}",
+        )
+        self.message = SimpleNamespace(message_id=message_id)
+        self.answers = []
+
+    async def answer(self, text=None, show_alert=False):
+        self.answers.append((text, show_alert))
 
 
 class ProgressionTests(unittest.IsolatedAsyncioTestCase):
@@ -17,7 +64,13 @@ class ProgressionTests(unittest.IsolatedAsyncioTestCase):
         self.db = os.path.join(self.tmp.name, "test.db")
         database.DB_NAME = self.db
         engagement.DB_NAME = self.db
+        level_tags.DB_NAME = self.db
         factory_orders.DB_NAME = self.db
+        admin_factory.DB_NAME = self.db
+        level_tags._pending_users.clear()
+        level_tags._chat_rights_cache.clear()
+        level_tags._tag_state_cache.clear()
+        level_tags._bot = None
         await database.create_tables()
         await engagement.create_engagement_tables()
 
@@ -29,6 +82,30 @@ class ProgressionTests(unittest.IsolatedAsyncioTestCase):
         async with aiosqlite.connect(self.db) as db:
             await db.execute("UPDATE users SET xp=?,level=? WHERE user_id=?", (xp, level, uid)); await db.commit()
 
+    async def order_status(self, order_id):
+        async with aiosqlite.connect(self.db) as db:
+            row = await (await db.execute(
+                "SELECT status,distributed_xp FROM factory_orders WHERE id=?",
+                (order_id,),
+            )).fetchone()
+        return row
+
+    async def complete_farm(self, user_id, coins=60000):
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute(
+                """INSERT OR REPLACE INTO farm_players
+                   (user_id,coins,opened_cells,created_at,updated_at)
+                   VALUES(?,?,?,?,?)""",
+                (user_id, coins, json.dumps(list(range(9))), 0, 0),
+            )
+            await db.executemany(
+                """INSERT OR REPLACE INTO farm_cells
+                   (user_id,cell_idx,module_type,level,spec,status)
+                   VALUES(?,?,?,?,?,?)""",
+                [(user_id, cell_idx, "generator", 3, "stable", "ok") for cell_idx in range(9)],
+            )
+            await db.commit()
+
     async def test_old_level_and_xp_are_preserved(self):
         await self.user(1, 12345, 5)
         row = await database.get_user(1)
@@ -36,6 +113,59 @@ class ProgressionTests(unittest.IsolatedAsyncioTestCase):
         await database.update_xp(1, 1000)
         row = await database.get_user(1)
         self.assertEqual((row[3], row[4]), (13345, 5))
+
+    async def test_legacy_level_fives_are_recalculated_once(self):
+        legacy_tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        legacy_db = os.path.join(legacy_tmp.name, "legacy.db")
+        conn = sqlite3.connect(legacy_db)
+        conn.execute("""CREATE TABLE users (
+            user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT,
+            xp INTEGER DEFAULT 0, level INTEGER DEFAULT 1, warns INTEGER DEFAULT 0,
+            mod_level INTEGER DEFAULT 0, reputation INTEGER DEFAULT 0,
+            last_wipe_date TEXT, last_free_dice_ts INTEGER DEFAULT 0
+        )""")
+        conn.executemany(
+            """INSERT INTO users(user_id,username,full_name,xp,level)
+               VALUES(?,?,?,?,?)""",
+            [
+                (1, "u1", "U1", 0, 5),
+                (2, "u2", "U2", 64500, 5),
+                (3, "u3", "U3", 264500, 5),
+                (4, "u4", "U4", 1234, 4),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        original_db = database.DB_NAME
+        database.DB_NAME = legacy_db
+        level_tags.DB_NAME = legacy_db
+        try:
+            await database.create_tables()
+            conn = sqlite3.connect(legacy_db)
+            rows = conn.execute("SELECT user_id,xp,level FROM users ORDER BY user_id").fetchall()
+            marker = conn.execute(
+                "SELECT COUNT(*) FROM data_migrations WHERE migration_key=?",
+                (database.LEGACY_LEVEL_FIVE_MIGRATION,),
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(rows, [
+                (1, 5500, 3),
+                (2, 0, 4),
+                (3, 0, 5),
+                (4, 1234, 4),
+            ])
+            self.assertEqual(marker, 1)
+
+            await database.create_tables()
+            conn = sqlite3.connect(legacy_db)
+            rows_again = conn.execute("SELECT user_id,xp,level FROM users ORDER BY user_id").fetchall()
+            conn.close()
+            self.assertEqual(rows_again, rows)
+        finally:
+            database.DB_NAME = original_db
+            level_tags.DB_NAME = original_db
+            legacy_tmp.cleanup()
 
     async def test_new_level_thresholds(self):
         await self.user(1, 9990, 1)
@@ -53,9 +183,9 @@ class ProgressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_reputation_full_then_reduced_for_seven_days(self):
         await self.user(1, level=4); await self.user(2)
         self.assertEqual(await database.give_reputation(1, 2), "success_full")
-        tomorrow = (datetime.now().date()).replace(day=datetime.now().day).strftime("%Y-%m-%d")
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         async with aiosqlite.connect(self.db) as db:
-            await db.execute("UPDATE rep_history SET date_str='2026-07-17' WHERE from_id=1")
+            await db.execute("UPDATE rep_history SET date_str=? WHERE from_id=1", (yesterday,))
             await db.commit()
         # A different calendar date inside seven days remains a reduced reward.
         self.assertEqual(await database.give_reputation(1, 2), "success_repeat")
@@ -129,6 +259,305 @@ class ProgressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(result["wave_users"]), {1, 2, 3, 4})
         # User 1: turn + reply reward + wave = 35.
         self.assertEqual((await database.get_user(1))[3], 35)
+
+    async def test_level_tag_is_sent_only_initially_and_after_level_change(self):
+        class FakeBot:
+            id = 999
+
+            def __init__(self):
+                self.tags = []
+
+            async def get_chat_member(self, chat_id, user_id):
+                return SimpleNamespace(status="administrator", can_manage_tags=True)
+
+            async def set_chat_member_tag(self, chat_id, user_id, tag):
+                self.tags.append((chat_id, user_id, tag))
+                return True
+
+        bot = FakeBot()
+        await self.user(50, xp=9990, level=1)
+        message = SimpleNamespace(
+            bot=bot,
+            chat=SimpleNamespace(id=-100500, type="supergroup"),
+            from_user=SimpleNamespace(id=50, username="u50", full_name="U50", is_bot=False),
+        )
+        await level_tags.ensure_level_tag(message)
+        await level_tags.ensure_level_tag(message)
+        self.assertEqual(bot.tags, [(-100500, 50, "Уровень 1")])
+
+        await database.update_xp(50, 20)
+        await level_tags.ensure_level_tag(message)
+        self.assertEqual(bot.tags[-1], (-100500, 50, "Уровень 2"))
+        self.assertEqual(len(bot.tags), 2)
+
+    async def test_forced_level_tag_repairs_stale_telegram_tag(self):
+        class FakeBot:
+            id = 999
+
+            def __init__(self):
+                self.tags = []
+                self.current_tag = "Уровень 1"
+
+            async def get_chat_member(self, chat_id, user_id):
+                if user_id == self.id:
+                    return SimpleNamespace(status="administrator", can_manage_tags=True)
+                return SimpleNamespace(status="member", tag=self.current_tag)
+
+            async def set_chat_member_tag(self, chat_id, user_id, tag):
+                self.tags.append((chat_id, user_id, tag))
+                self.current_tag = tag
+
+        bot = FakeBot()
+        await self.user(60, xp=10, level=2)
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute(
+                """INSERT INTO chat_level_tags(chat_id,user_id,applied_level,retry_after,last_error)
+                   VALUES(-100600,60,2,0,'')"""
+            )
+            await db.commit()
+        self.assertTrue(await level_tags.sync_level_tag(bot, -100600, 60, 2, force=True))
+        self.assertEqual(bot.tags, [
+            (-100600, 60, ""),
+            (-100600, 60, "Уровень 2"),
+        ])
+
+    async def test_factory_admin_discussion_uses_real_completion_rules(self):
+        bot = FakeFactoryBot()
+        await self.user(1)
+        for user_id in range(2, 7):
+            await self.user(user_id)
+        order, error = await factory_orders.launch_factory_order(
+            bot, -1001, 1, "Owner", "discussion", "small",
+            "Какая игра вас разочаровала?", charge_factory=False,
+        )
+        self.assertFalse(error)
+        panel_text, panel_kb = await admin_factory.build_factory_admin_view(-1001)
+        self.assertIn(f"Заказ:</b> #{order['id']}", panel_text)
+        self.assertTrue(panel_kb.inline_keyboard)
+        picker_text, picker_kb = await admin_factory.build_factory_chat_picker(bot)
+        self.assertIn("Выберите группу", picker_text)
+        self.assertEqual(picker_kb.inline_keyboard[0][0].callback_data, "facadm_chat:-1001")
+        ok, message = await factory_orders.admin_advance_factory_order(bot, order["id"])
+        self.assertFalse(ok)
+        self.assertIn("участников 0/5", message)
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.executemany(
+                """INSERT INTO factory_order_participants
+                   (order_id,user_id,display_name,replies_received,joined_at)
+                   VALUES(?,?,?,?,?)""",
+                [(order["id"], user_id, f"U{user_id}", 1, user_id) for user_id in range(2, 7)],
+            )
+            await db.executemany(
+                """INSERT INTO factory_order_messages
+                   (order_id,message_id,author_id,parent_author_id)
+                   VALUES(?,?,?,?)""",
+                [
+                    (order["id"], 1000 + index, 2 + index % 5, 2 + (index + 1) % 5)
+                    for index in range(10)
+                ],
+            )
+            await db.commit()
+        ok, _message = await factory_orders.admin_advance_factory_order(bot, order["id"])
+        self.assertTrue(ok)
+        self.assertEqual((await self.order_status(order["id"]))[0], "completed")
+        self.assertEqual((await self.order_status(order["id"]))[1], 500)
+
+    async def test_factory_admin_photo_runs_collection_vote_and_payout(self):
+        bot = FakeFactoryBot()
+        await self.user(1)
+        for user_id in range(2, 6):
+            await self.user(user_id)
+        order, error = await factory_orders.launch_factory_order(
+            bot, -1002, 1, "Owner", "photo", "small",
+            "Покажите рабочее место", charge_factory=False,
+        )
+        self.assertFalse(error)
+        async with aiosqlite.connect(self.db) as db:
+            await db.executemany(
+                """INSERT INTO factory_order_participants
+                   (order_id,user_id,display_name,submission_message_id,joined_at)
+                   VALUES(?,?,?,?,?)""",
+                [(order["id"], user_id, f"U{user_id}", 2000 + user_id, user_id) for user_id in range(2, 6)],
+            )
+            await db.commit()
+        ok, _ = await factory_orders.admin_advance_factory_order(bot, order["id"])
+        self.assertTrue(ok)
+        active = await factory_orders._order(order_id=order["id"])
+        self.assertEqual(active["status"], "voting")
+        ok, _ = await factory_orders.admin_advance_factory_order(bot, order["id"])
+        self.assertTrue(ok)
+        self.assertEqual((await self.order_status(order["id"]))[0], "completed")
+        self.assertEqual((await self.order_status(order["id"]))[1], 500)
+
+    async def test_factory_tournament_full_player_path_and_stale_button_guard(self):
+        bot = FakeFactoryBot()
+        await self.user(1)
+        for user_id in range(10, 14):
+            await self.user(user_id, xp=1000)
+        order, error = await factory_orders.launch_factory_order(
+            bot, -1003, 1, "Owner", "tournament", "small", charge_factory=False,
+        )
+        self.assertFalse(error)
+        for user_id in range(10, 14):
+            await factory_orders.tournament_join(
+                FakeCallback(bot, f"fjoin:{order['id']}", user_id)
+            )
+        active = await factory_orders._order(order_id=order["id"])
+        self.assertEqual(active["status"], "tournament")
+
+        first_pair = None
+        for match_no in ("1", "2", "3"):
+            active = await factory_orders._order(order_id=order["id"])
+            meta = json.loads(active["metadata"])
+            self.assertEqual(factory_orders._current_tournament_match(meta), match_no)
+            pair = meta["matches"][match_no]
+            if match_no == "1":
+                first_pair = pair
+            stage_id = int(meta["stage_message_id"])
+            await factory_orders.tournament_tactic(
+                FakeCallback(bot, f"ftac:{order['id']}:{match_no}:atk", pair[0], stage_id)
+            )
+            await factory_orders.tournament_tactic(
+                FakeCallback(bot, f"ftac:{order['id']}:{match_no}:trick", pair[1], stage_id)
+            )
+            if match_no == "1":
+                stale = FakeCallback(bot, f"ftac:{order['id']}:1:def", first_pair[0], stage_id)
+                await factory_orders.tournament_tactic(stale)
+                self.assertIn("уже завершён", stale.answers[-1][0])
+
+        self.assertEqual((await self.order_status(order["id"]))[0], "completed")
+        total = 0
+        for user_id in (1, 10, 11, 12, 13):
+            user = await database.get_user(user_id)
+            total += database.total_available_xp(user[3], user[4])
+        self.assertEqual(total, 4500)
+
+    async def test_factory_admin_cancel_refunds_tournament_stakes(self):
+        bot = FakeFactoryBot()
+        await self.user(1)
+        for user_id in (20, 21):
+            await self.user(user_id, xp=500)
+        order, _ = await factory_orders.launch_factory_order(
+            bot, -1004, 1, "Owner", "tournament", "small", charge_factory=False,
+        )
+        for user_id in (20, 21):
+            await factory_orders.tournament_join(
+                FakeCallback(bot, f"fjoin:{order['id']}", user_id)
+            )
+        self.assertEqual((await database.get_user(20))[3], 400)
+        duplicate = FakeCallback(bot, f"fjoin:{order['id']}", 20)
+        await factory_orders.tournament_join(duplicate)
+        self.assertEqual((await database.get_user(20))[3], 400)
+        self.assertIn("уже участвуете", duplicate.answers[-1][0])
+        ok, _ = await factory_orders.admin_cancel_factory_order(bot, order["id"])
+        self.assertTrue(ok)
+        self.assertEqual((await database.get_user(20))[3], 500)
+        self.assertEqual((await database.get_user(21))[3], 500)
+        self.assertEqual((await self.order_status(order["id"]))[0], "cancelled")
+        again, _ = await factory_orders.admin_cancel_factory_order(bot, order["id"])
+        self.assertFalse(again)
+
+    async def test_tournament_stage_publish_failure_refunds_every_stake(self):
+        class StageFailBot(FakeFactoryBot):
+            async def send_message(self, chat_id, text, reply_markup=None, **kwargs):
+                if len(self.sent) == 1:
+                    raise RuntimeError("stage publish failed")
+                return await super().send_message(chat_id, text, reply_markup, **kwargs)
+
+        bot = StageFailBot()
+        await self.user(1)
+        for user_id in range(30, 34):
+            await self.user(user_id, xp=500)
+        order, error = await factory_orders.launch_factory_order(
+            bot, -1006, 1, "Owner", "tournament", "small", charge_factory=False,
+        )
+        self.assertFalse(error)
+        for user_id in range(30, 34):
+            await factory_orders.tournament_join(
+                FakeCallback(bot, f"fjoin:{order['id']}", user_id)
+            )
+        self.assertEqual((await self.order_status(order["id"]))[0], "cancelled")
+        for user_id in range(30, 34):
+            self.assertEqual((await database.get_user(user_id))[3], 500)
+
+    async def test_factory_launch_failure_leaves_no_active_order(self):
+        class FailingBot(FakeFactoryBot):
+            async def send_message(self, *args, **kwargs):
+                raise RuntimeError("telegram unavailable")
+
+        bot = FailingBot()
+        await self.user(1)
+        order, error = await factory_orders.launch_factory_order(
+            bot, -1005, 1, "Owner", "discussion", "small",
+            "Проверка отката запуска", charge_factory=False,
+        )
+        self.assertIsNone(order)
+        self.assertIn("не смог", error)
+        self.assertIsNone(await factory_orders._order(chat_id=-1005))
+
+    async def test_admin_stop_of_player_order_returns_full_coin_cost(self):
+        bot = FakeFactoryBot()
+        await self.user(70)
+        await self.complete_farm(70)
+        order, error = await factory_orders.launch_factory_order(
+            bot, -1007, 70, "Player", "discussion", "small",
+            "Тема обычного игрока", charge_factory=True,
+        )
+        self.assertFalse(error)
+        async with aiosqlite.connect(self.db) as db:
+            coins = (await (await db.execute(
+                "SELECT coins FROM farm_players WHERE user_id=70"
+            )).fetchone())[0]
+        self.assertEqual(coins, 10000)
+        ok, _ = await factory_orders.admin_cancel_factory_order(bot, order["id"])
+        self.assertTrue(ok)
+        async with aiosqlite.connect(self.db) as db:
+            coins = (await (await db.execute(
+                "SELECT coins FROM farm_players WHERE user_id=70"
+            )).fetchone())[0]
+        self.assertEqual(coins, 60000)
+
+    async def test_player_order_publish_failure_returns_full_coin_cost(self):
+        class FailingBot(FakeFactoryBot):
+            async def send_message(self, *args, **kwargs):
+                raise RuntimeError("telegram unavailable")
+
+        bot = FailingBot()
+        await self.user(71)
+        await self.complete_farm(71)
+        order, error = await factory_orders.launch_factory_order(
+            bot, -1008, 71, "Player", "photo", "small",
+            "Тема с ошибкой Telegram", charge_factory=True,
+        )
+        self.assertIsNone(order)
+        self.assertTrue(error)
+        async with aiosqlite.connect(self.db) as db:
+            coins = (await (await db.execute(
+                "SELECT coins FROM farm_players WHERE user_id=71"
+            )).fetchone())[0]
+        self.assertEqual(coins, 60000)
+
+    async def test_factory_cleanup_removes_all_stage_messages(self):
+        class FakeBot:
+            def __init__(self):
+                self.deleted = []
+
+            async def delete_message(self, chat_id, message_id):
+                self.deleted.append((chat_id, message_id))
+
+        bot = FakeBot()
+        order = {
+            "chat_id": -1001,
+            "message_id": 10,
+            "vote_message_id": 11,
+            "metadata": '{"stage_message_id": 12}',
+        }
+        await factory_orders._cleanup_order_messages(bot, order, [13])
+        self.assertEqual(
+            set(bot.deleted),
+            {(-1001, 10), (-1001, 11), (-1001, 12), (-1001, 13)},
+        )
 
 
 if __name__ == "__main__":

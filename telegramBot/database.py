@@ -64,6 +64,7 @@ SYNCABLE_TABLES = [
     "farm_players", "farm_cells", "month_scores", "month_results",
     "duel_history", "active_duels", "factory_orders",
     "factory_order_participants", "factory_order_messages", "factory_order_votes",
+    "chat_level_tags", "data_migrations",
 ]
 
 MONTH_PRIZES = (10000, 5000, 2500)
@@ -78,7 +79,13 @@ EXTRA_SYNC_COLUMNS = {
     "factory_order_participants": ("order_id", "user_id", "display_name", "submission_message_id", "replies_received", "joined_at"),
     "factory_order_messages": ("order_id", "message_id", "author_id", "parent_author_id"),
     "factory_order_votes": ("order_id", "voter_id", "candidate_id"),
+    "chat_level_tags": ("chat_id", "user_id", "applied_level", "retry_after", "last_error"),
+    "data_migrations": ("migration_key", "applied_at"),
 }
+
+LEGACY_LEVEL_CAPS = {1: 500, 2: 2000, 3: 8000, 4: 25000}
+LEGACY_LEVEL_FIVE_TOTAL = sum(LEGACY_LEVEL_CAPS.values())
+LEGACY_LEVEL_FIVE_MIGRATION = "legacy_level_five_to_2026_caps_v1"
 
 
 def _normalize_neon_dsn(raw_dsn: str) -> str:
@@ -427,9 +434,22 @@ async def _ensure_neon_schema():
             CREATE TABLE IF NOT EXISTS factory_order_participants (order_id BIGINT, user_id BIGINT, display_name TEXT, submission_message_id BIGINT, replies_received INTEGER, joined_at BIGINT, PRIMARY KEY(order_id,user_id));
             CREATE TABLE IF NOT EXISTS factory_order_messages (order_id BIGINT, message_id BIGINT, author_id BIGINT, parent_author_id BIGINT, PRIMARY KEY(order_id,message_id));
             CREATE TABLE IF NOT EXISTS factory_order_votes (order_id BIGINT, voter_id BIGINT, candidate_id BIGINT, PRIMARY KEY(order_id,voter_id));
+            CREATE TABLE IF NOT EXISTS chat_level_tags (
+                chat_id BIGINT,
+                user_id BIGINT,
+                applied_level INTEGER DEFAULT 0,
+                retry_after BIGINT DEFAULT 0,
+                last_error TEXT DEFAULT '',
+                PRIMARY KEY(chat_id,user_id)
+            );
+            CREATE TABLE IF NOT EXISTS data_migrations (
+                migration_key TEXT PRIMARY KEY,
+                applied_at BIGINT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);
             CREATE INDEX IF NOT EXISTS idx_users_level_xp ON users (level DESC, xp DESC);
             CREATE INDEX IF NOT EXISTS idx_farm_cells_user ON farm_cells (user_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_level_tags_user ON chat_level_tags (user_id);
             """
         )
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT")
@@ -759,6 +779,8 @@ async def _sync_loop():
                 _next_sync_attempt_at = now + SYNC_RETRY_INTERVAL_SECONDS
                 _schedule_retry_wakeup()
                 continue
+            # Neon is authoritative. Only now is it safe to migrate restored data.
+            await migrate_legacy_level_fives()
 
         if SYNC_CHECK_INTERVAL_SECONDS > 0 and _last_sync_check_at and (now - _last_sync_check_at) < SYNC_CHECK_INTERVAL_SECONDS:
             continue
@@ -832,6 +854,72 @@ async def _startup_bootstrap():
     if not bootstrapped:
         _next_sync_attempt_at = _now_ts() + SYNC_RETRY_INTERVAL_SECONDS
         _schedule_retry_wakeup()
+
+
+def _level_state_from_total_xp(total_xp: int):
+    total = max(0, int(total_xp))
+    if total >= 300000:
+        return 5, total - 300000
+    if total >= 100000:
+        return 4, total - 100000
+    if total >= 30000:
+        return 3, total - 30000
+    if total >= 10000:
+        return 2, total - 10000
+    return 1, total
+
+
+def _queue_level_tag_refresh(user_id: int):
+    try:
+        from level_tags import queue_level_tag_refresh
+        queue_level_tag_refresh(int(user_id))
+    except Exception:
+        pass
+
+
+async def migrate_legacy_level_fives():
+    """
+    One-time conversion of grandfathered level-5 users.
+
+    The old model required 35,500 XP to enter level 5. We reconstruct that
+    earned total, then express it using the current cumulative thresholds.
+    """
+    changed_users = []
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        applied = await (await db.execute(
+            "SELECT 1 FROM data_migrations WHERE migration_key = ?",
+            (LEGACY_LEVEL_FIVE_MIGRATION,),
+        )).fetchone()
+        if applied:
+            await db.rollback()
+            return 0
+
+        rows = await (await db.execute(
+            "SELECT user_id, xp FROM users WHERE level = 5"
+        )).fetchall()
+        for user_id, residual_xp in rows:
+            total_xp = LEGACY_LEVEL_FIVE_TOTAL + max(0, int(residual_xp or 0))
+            new_level, new_xp = _level_state_from_total_xp(total_xp)
+            await db.execute(
+                "UPDATE users SET level = ?, xp = ? WHERE user_id = ?",
+                (new_level, new_xp, user_id),
+            )
+            changed_users.append(int(user_id))
+
+        await db.execute(
+            "INSERT INTO data_migrations(migration_key, applied_at) VALUES (?, ?)",
+            (LEGACY_LEVEL_FIVE_MIGRATION, int(time.time())),
+        )
+        await db.commit()
+
+    await _mark_dirty("data_migrations", *(["users"] if changed_users else []))
+    for user_id in changed_users:
+        _queue_level_tag_refresh(user_id)
+    if changed_users:
+        logging.info("Пересчитаны старые уровни 5: %s пользователей", len(changed_users))
+    return len(changed_users)
+
 
 async def create_tables():
     async with aiosqlite.connect(DB_NAME) as db:
@@ -1020,12 +1108,29 @@ async def create_tables():
             candidate_id INTEGER NOT NULL,
             PRIMARY KEY (order_id, voter_id)
         )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS chat_level_tags (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            applied_level INTEGER DEFAULT 0,
+            retry_after INTEGER DEFAULT 0,
+            last_error TEXT DEFAULT '',
+            PRIMARY KEY (chat_id, user_id)
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS data_migrations (
+            migration_key TEXT PRIMARY KEY,
+            applied_at INTEGER NOT NULL
+        )''')
         await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_factory_one_active_chat ON factory_orders(chat_id) WHERE status IN (\'active\', \'voting\', \'tournament\')')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_duel_pair_day ON duel_history(player1_id, player2_id, resolved_at)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_month_score_rank ON month_scores(month_key, xp_earned DESC)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_chat_level_tags_user ON chat_level_tags(user_id)')
         
         await db.commit()
     await _startup_bootstrap()
+    # If Neon was unavailable, the retry loop will run this migration after the
+    # authoritative copy has been restored instead of touching a stale local DB.
+    if _bootstrap_complete:
+        await migrate_legacy_level_fives()
     await finalize_closed_months()
     await refund_interrupted_duels()
 
@@ -1160,6 +1265,8 @@ async def update_xp(user_id, xp_amount, count_monthly=False, month_key=None):
             ''', (key, user_id, int(xp_amount)))
         await db.commit()
         await _mark_dirty("users", *( ["month_scores"] if count_monthly and xp_amount > 0 else [] ))
+        if current_lvl != old_lvl:
+            _queue_level_tag_refresh(user_id)
         return (old_lvl, current_lvl, xp_amount)
 
 async def give_reputation(from_user_id, to_user_id):
@@ -1243,6 +1350,7 @@ async def finalize_closed_months(now=None):
                 "SELECT DISTINCT month_key FROM month_scores WHERE month_key < ? ORDER BY month_key", (current_key,)
             )).fetchall()
         for (key,) in rows:
+            level_changes = set()
             async with aiosqlite.connect(DB_NAME) as db:
                 exists = await (await db.execute(
                     "SELECT 1 FROM month_results WHERE month_key=?", (key,)
@@ -1257,17 +1365,22 @@ async def finalize_closed_months(now=None):
                     if not row:
                         continue
                     xp, lvl = int(row[0]), int(row[1])
+                    old_lvl = lvl
                     amount = MONTH_PRIZES[idx]
                     new_xp = xp + amount
                     while lvl < 5 and new_xp >= LEVEL_CAPS[lvl]:
                         new_xp -= int(LEVEL_CAPS[lvl]); lvl += 1
                     await db.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (new_xp, lvl, uid))
+                    if lvl != old_lvl:
+                        level_changes.add(uid)
                 padded = ids + [None] * (3 - len(ids))
                 await db.execute('''INSERT INTO month_results
                     (month_key,winner_id,second_id,third_id,finalized_at) VALUES(?,?,?,?,?)''',
                     (key, padded[0], padded[1], padded[2], int(time.time())))
                 await db.commit()
             await _mark_dirty("users", "month_results")
+            for uid in level_changes:
+                _queue_level_tag_refresh(uid)
 
 
 async def _month_processor():
@@ -1325,20 +1438,26 @@ async def escrow_active_duel(chat_id: int) -> bool:
         if not duel or duel[3] != "waiting_accept":
             await db.rollback(); return False
         balances = []
+        level_changes = set()
         for uid in duel[:2]:
             row = await (await db.execute("SELECT xp,level FROM users WHERE user_id=?", (uid,))).fetchone()
             if not row or total_available_xp(row[0], row[1]) < int(duel[2]):
                 await db.rollback(); return False
-            xp, lvl = int(row[0]) - int(duel[2]), int(row[1])
+            old_lvl = int(row[1])
+            xp, lvl = int(row[0]) - int(duel[2]), old_lvl
             while xp < 0 and lvl > 1:
                 lvl -= 1; xp += int(LEVEL_CAPS[lvl])
             if xp < 0:
                 await db.rollback(); return False
             balances.append((xp, lvl, uid))
+            if lvl != old_lvl:
+                level_changes.add(int(uid))
         await db.executemany("UPDATE users SET xp=?,level=? WHERE user_id=?", balances)
         await db.execute("UPDATE active_duels SET state='fighting',escrowed=1 WHERE chat_id=?", (chat_id,))
         await db.commit()
     await _mark_dirty("users", "active_duels")
+    for uid in level_changes:
+        _queue_level_tag_refresh(uid)
     return True
 
 
@@ -1350,6 +1469,7 @@ async def delete_active_duel(chat_id: int):
 
 async def refund_interrupted_duels():
     """A restart can invalidate old buttons; escrow is therefore returned safely."""
+    level_changes = set()
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("BEGIN IMMEDIATE")
         rows = await (await db.execute(
@@ -1358,16 +1478,22 @@ async def refund_interrupted_duels():
             for uid in (p1, p2):
                 state = await (await db.execute("SELECT xp,level FROM users WHERE user_id=?", (uid,))).fetchone()
                 if not state: continue
-                xp, lvl = int(state[0]) + int(bet), int(state[1])
+                old_lvl = int(state[1])
+                xp, lvl = int(state[0]) + int(bet), old_lvl
                 while lvl < 5 and xp >= LEVEL_CAPS[lvl]: xp -= int(LEVEL_CAPS[lvl]); lvl += 1
                 await db.execute("UPDATE users SET xp=?,level=? WHERE user_id=?", (xp, lvl, uid))
+                if lvl != old_lvl:
+                    level_changes.add(int(uid))
         await db.execute("DELETE FROM active_duels"); await db.commit()
     if rows:
         await _mark_dirty("active_duels", "users")
+        for uid in level_changes:
+            _queue_level_tag_refresh(uid)
 
 
 async def expire_stale_duels(max_age_seconds=900):
     cutoff = int(time.time()) - int(max_age_seconds)
+    level_changes = set()
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("BEGIN IMMEDIATE")
         rows = await (await db.execute('''SELECT chat_id,player1_id,player2_id,bet,escrowed
@@ -1377,14 +1503,19 @@ async def expire_stale_duels(max_age_seconds=900):
             for uid in (p1, p2):
                 state = await (await db.execute("SELECT xp,level FROM users WHERE user_id=?", (uid,))).fetchone()
                 if not state: continue
-                xp, lvl = int(state[0]) + int(bet), int(state[1])
+                old_lvl = int(state[1])
+                xp, lvl = int(state[0]) + int(bet), old_lvl
                 while lvl < 5 and xp >= LEVEL_CAPS[lvl]: xp -= int(LEVEL_CAPS[lvl]); lvl += 1
                 await db.execute("UPDATE users SET xp=?,level=? WHERE user_id=?", (xp, lvl, uid))
+                if lvl != old_lvl:
+                    level_changes.add(int(uid))
         if rows:
             await db.executemany("DELETE FROM active_duels WHERE chat_id=?", [(r[0],) for r in rows])
         await db.commit()
     if rows:
         await _mark_dirty("active_duels", "users")
+        for uid in level_changes:
+            _queue_level_tag_refresh(uid)
     return [(int(r[0]), bool(r[4])) for r in rows]
 
 
@@ -1411,6 +1542,7 @@ async def record_duel(duel: dict, result: str, commission_rate: int):
 
 async def settle_active_duel(duel: dict, winner_id=None, commission_rate=0):
     """Atomically pay/refund an escrowed duel and close it."""
+    level_changes = set()
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("BEGIN IMMEDIATE")
         row = await (await db.execute("SELECT escrowed FROM active_duels WHERE chat_id=?", (duel["chat_id"],))).fetchone()
@@ -1422,9 +1554,12 @@ async def settle_active_duel(duel: dict, winner_id=None, commission_rate=0):
         for uid, amount in awards.items():
             state = await (await db.execute("SELECT xp,level FROM users WHERE user_id=?", (uid,))).fetchone()
             if not state: continue
-            xp, lvl = int(state[0]) + int(amount), int(state[1])
+            old_lvl = int(state[1])
+            xp, lvl = int(state[0]) + int(amount), old_lvl
             while lvl < 5 and xp >= LEVEL_CAPS[lvl]: xp -= int(LEVEL_CAPS[lvl]); lvl += 1
             await db.execute("UPDATE users SET xp=?,level=? WHERE user_id=?", (xp, lvl, uid))
+            if lvl != old_lvl:
+                level_changes.add(int(uid))
         result = "draw" if winner_id is None else str(winner_id)
         await db.execute('''INSERT INTO duel_history
             (chat_id,player1_id,player2_id,bet,result,commission_rate,created_at,resolved_at)
@@ -1433,6 +1568,8 @@ async def settle_active_duel(duel: dict, winner_id=None, commission_rate=0):
         await db.execute("DELETE FROM active_duels WHERE chat_id=?", (duel["chat_id"],))
         await db.commit()
     await _mark_dirty("users", "duel_history", "active_duels")
+    for uid in level_changes:
+        _queue_level_tag_refresh(uid)
     return sum(awards.values()) if winner_id is not None else 0
 
 
@@ -1615,6 +1752,7 @@ async def trigger_manual_sync():
                 details = _last_neon_error or "причина не зафиксирована"
                 return {"ok": False, "message": f"Startup-восстановление Neon не завершено.\nДетали: {details}"}
 
+            await migrate_legacy_level_fives()
             dirty = await _load_dirty_tables()
             if not dirty:
                 return {"ok": True, "message": "Синхронизация не нужна: изменений нет."}

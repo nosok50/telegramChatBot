@@ -66,6 +66,7 @@ def main_admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Белый список", callback_data="nav_whitelist"),
          InlineKeyboardButton(text="🤬 Фильтр слов", callback_data="nav_badwords")],
+        [InlineKeyboardButton(text="🏭 События цеха", callback_data="nav_factory_events")],
         [InlineKeyboardButton(text="🗄 DB статус", callback_data="nav_db_status")],
         [InlineKeyboardButton(text="❌ Закрыть панель", callback_data="close_admin")]
     ])
@@ -131,6 +132,8 @@ async def open_admin(message: types.Message):
     if message.from_user.id != OWNER_ID:
         return
     await delete_later(message, 0)
+    if message.chat.type != "private":
+        return
     
     await answer_temp(
         message,

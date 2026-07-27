@@ -20,6 +20,7 @@ from utils import (
     answer_temp, answer_persistent, get_user_link, delete_later,
     parse_command_complex, text_analyzer, moderation_help_text
 )
+from level_tags import sync_level_tag
 
 router = Router()
 
@@ -75,6 +76,15 @@ def _compact_text(text: str) -> str:
     return re.sub(r"[^a-zа-я0-9]+", "", _plain_text(text))
 
 
+def _is_short_loan_bait(text: str) -> bool:
+    """Catch standalone loan bait without treating normal conversation as advertising."""
+    value = _compact_text(text)
+    return bool(re.fullmatch(
+        r"(?:дамвдолг|даювдолг|выдамвдолг|дамзайм|выдамзайм|одолжуденьги)\d*",
+        value,
+    ))
+
+
 def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
     """Score combinations typical for unsolicited money/job/drug advertising."""
     whitelist = whitelist or []
@@ -89,6 +99,10 @@ def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
         ))
         has_mass_offer = any(token in value for token in (
             "раздаю", "каждому", "первым", "всемдам", "скину", "дамденег",
+        ))
+        has_loan_offer = any(token in value for token in (
+            "дамвдолг", "даювдолг", "выдамвдолг", "дамзайм",
+            "выдамзайм", "одолжуденьги",
         ))
         has_money = bool(re.search(r"\d{2,}(руб|рублей|₽|вдень|задень|засмену)", value))
         has_work = any(token in value for token in (
@@ -111,6 +125,11 @@ def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
             r"скину|дам\s+денег)\b",
             normalized,
         ))
+        has_loan_offer = bool(re.search(
+            r"\b(?:(?:дам|даю|выдам|предоставлю)\s+(?:деньги\s+)?в\s+долг|"
+            r"(?:дам|выдам|оформлю)\s+(?:займ|кредит)|одолжу\s+(?:деньги|сумму))\b",
+            normalized,
+        ))
         has_money = bool(re.search(
             r"(?:\b\d{2,}\s*(?:руб\w*|₽)|\b\d{3,}\s*(?:в|за)\s*(?:день|смену))",
             normalized,
@@ -129,6 +148,7 @@ def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
         2 if has_link else 0,
         2 if has_cta else 0,
         2 if has_mass_offer else 0,
+        2 if has_loan_offer else 0,
         2 if has_money else 0,
         2 if has_work else 0,
         2 if has_drug else 0,
@@ -172,7 +192,18 @@ class AutoModerationTracker:
         removed = set(ids)
         self.messages[key] = [item for item in self.messages.get(key, []) if item["id"] not in removed]
 
-    def analyze(self, chat_id: int, user_id: int, message_id: int, text: str, user_level: int, badwords, whitelist):
+    def analyze(
+        self,
+        chat_id: int,
+        user_id: int,
+        message_id: int,
+        text: str,
+        user_level: int,
+        badwords,
+        whitelist,
+        is_reply: bool = False,
+        user_xp: int = 0,
+    ):
         now = time.time()
         key = (chat_id, user_id)
         history = [item for item in self.messages.get(key, []) if now - item["time"] <= 60]
@@ -183,7 +214,13 @@ class AutoModerationTracker:
 
         recent_text = [item for item in history if now - item["time"] <= 15 and item["text"]]
         combined = " ".join(item["text"] for item in recent_text)
-        if _advertising_score(normalized, whitelist) >= 4 or (
+        is_untrusted_loan_bait = (
+            user_level <= 1
+            and user_xp < 50
+            and not is_reply
+            and _is_short_loan_bait(normalized)
+        )
+        if is_untrusted_loan_bait or _advertising_score(normalized, whitelist) >= 4 or (
             len(recent_text) >= 2 and _advertising_score(combined, whitelist) >= 4
         ):
             return {"action": "advertising", "ids": [item["id"] for item in recent_text]}
@@ -297,6 +334,8 @@ class FloodMiddleware(BaseMiddleware):
                 user_level,
                 badwords,
                 whitelist,
+                is_reply=event.reply_to_message is not None,
+                user_xp=int(user_data[3] or 0) if user_data else 0,
             )
             action = decision["action"]
             if action == "allow":
@@ -814,6 +853,14 @@ async def cmd_addxp(message: types.Message, command: CommandObject):
          return await answer_temp(message, "Пользователь не найден.")
 
     old_lvl, new_lvl, _ = await update_xp(data['target_id'], amount)
+    if message.chat.type != "private":
+        await sync_level_tag(
+            message.bot,
+            message.chat.id,
+            data["target_id"],
+            new_lvl,
+            force=True,
+        )
     
     target_link = get_user_link(data['target_id'], data['target_name'])
     msg_text = f"💳 Администратор выдал <code>{amount} XP</code> пользователю {target_link}."
@@ -822,7 +869,6 @@ async def cmd_addxp(message: types.Message, command: CommandObject):
         msg_text += f"\n\n🆙 <b>Уровень повышен до {new_lvl}!</b>"
     elif new_lvl < old_lvl:
         msg_text += f"\n\n📉 <b>Уровень понижен до {new_lvl}...</b>"
-
     await answer_temp(message, msg_text)
 
 

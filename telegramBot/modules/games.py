@@ -46,6 +46,7 @@ import time
 from collections import defaultdict
 from functools import wraps
 from config import OWNER_ID
+from modules.factory_orders import build_factory_help_main
 
 router = Router()
 
@@ -472,16 +473,10 @@ async def farm_orders_info(callback: types.CallbackQuery):
     owner_id = int(callback.data.split(":")[1])
     if callback.from_user.id != owner_id:
         return await callback.answer("Это не ваш завод.", show_alert=True)
+    await touch_temp_message(callback.message)
     await callback.answer()
-    await callback.message.answer(
-        "📦 <b>Заводские заказы</b>\n\n"
-        "Запускаются в групповом чате:\n"
-        "<code>/factory_order discussion small тема</code>\n"
-        "<code>/factory_order photo medium тема</code>\n"
-        "<code>/factory_order tournament large</code>\n\n"
-        "Small: 50 000 монет → банк 500 XP\n"
-        "Medium: 200 000 → 2 000 XP\n"
-        "Large: 500 000 → 5 000 XP")
+    text, kb = build_factory_help_main(owner_id)
+    await _farm_edit_message(callback.message, text, kb)
 
 
 async def _farm_render_locked_cell(owner_id: int, state: dict, cell_idx: int):
@@ -1507,7 +1502,8 @@ async def _duel_processor(bot):
                 text = "⌛ Дуэль отменена по тайм-ауту."
                 if escrowed:
                     text += " Обе ставки возвращены."
-                await bot.send_message(chat_id, text)
+                sent = await bot.send_message(chat_id, text)
+                asyncio.create_task(delete_later(sent, 60))
         except Exception:
             pass
         await asyncio.sleep(30)
