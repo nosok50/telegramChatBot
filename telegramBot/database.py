@@ -999,6 +999,19 @@ async def create_tables():
         )''')
         await db.execute('''CREATE INDEX IF NOT EXISTS idx_recent_user_messages_lookup
             ON recent_user_messages (chat_id, user_id, created_at DESC)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS chat_user_activity (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            first_message_at INTEGER NOT NULL,
+            last_message_at INTEGER NOT NULL,
+            PRIMARY KEY (chat_id, user_id)
+        )''')
+        await db.execute('''INSERT OR IGNORE INTO chat_user_activity
+            (chat_id, user_id, message_count, first_message_at, last_message_at)
+            SELECT chat_id, user_id, COUNT(*), MIN(created_at), MAX(created_at)
+            FROM recent_user_messages
+            GROUP BY chat_id, user_id''')
         await db.execute('''CREATE TABLE IF NOT EXISTS sync_meta (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -1175,18 +1188,34 @@ async def get_id_by_username(username: str):
 
 
 async def track_recent_message(chat_id: int, user_id: int, message_id: int, created_at: int = None):
-    """Remember a message so moderators can later clear a user's recent history."""
+    """Remember a message and return its lifetime number for this user in this chat."""
     timestamp = int(created_at or time.time())
     cutoff = timestamp - (48 * 60 * 60)
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
+        insert_cursor = await db.execute(
             '''INSERT OR IGNORE INTO recent_user_messages
                (chat_id, user_id, message_id, created_at, deleted_at)
                VALUES (?, ?, ?, ?, NULL)''',
             (chat_id, user_id, message_id, timestamp),
         )
+        if insert_cursor.rowcount:
+            await db.execute(
+                '''INSERT INTO chat_user_activity
+                   (chat_id, user_id, message_count, first_message_at, last_message_at)
+                   VALUES (?, ?, 1, ?, ?)
+                   ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                       message_count = message_count + 1,
+                       last_message_at = excluded.last_message_at''',
+                (chat_id, user_id, timestamp, timestamp),
+            )
         await db.execute('DELETE FROM recent_user_messages WHERE created_at < ?', (cutoff,))
+        cursor = await db.execute(
+            'SELECT message_count FROM chat_user_activity WHERE chat_id = ? AND user_id = ?',
+            (chat_id, user_id),
+        )
+        row = await cursor.fetchone()
         await db.commit()
+        return int(row[0]) if row else 1
 
 
 async def get_recent_message_ids(

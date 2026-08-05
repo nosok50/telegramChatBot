@@ -85,6 +85,49 @@ def _is_short_loan_bait(text: str) -> bool:
     ))
 
 
+def _has_newcomer_action(text: str) -> bool:
+    """Broad action/recruitment pattern used only for a direct member's first two messages."""
+    normalized = _plain_text(text)
+    return bool(re.search(
+        r"(?:"
+        r"\b(?:нужен|нужны|ищу|ищем|набираем|требуется|требуются)\s+"
+        r"(?:человек\w*|люд\w*|курьер\w*|доставщик\w*|исполнител\w*|"
+        r"сотрудник\w*|работник\w*)|"
+        r"\bкто\s.{0,35}\b(?:готов|хочет|может|сможет|играть|поиграть|пойдет)\b|"
+        r"\b(?:заходи|заходите|переходи|переходите|жми|жмите|пиши|пишите|"
+        r"напиши|напишите|откликайся|откликайтесь|присоединяйся|присоединяйтесь|"
+        r"забирай|забирайте|проверяй|проверяйте|отмечай|отмечайте)\b|"
+        r"\b(?:давайте|го)\s+\w+|"
+        r"\bинформаци\w*\s+(?:в|на)\s+(?:профил\w*|канал\w*|бот\w*)"
+        r")",
+        normalized,
+    ))
+
+
+def _is_channel_post_comment(message: types.Message) -> bool:
+    reply = message.reply_to_message
+    if not reply:
+        return False
+    if getattr(reply, "is_automatic_forward", False):
+        return True
+    sender_chat = getattr(reply, "sender_chat", None)
+    return bool(sender_chat and getattr(sender_chat, "type", None) == "channel")
+
+
+async def _is_current_chat_member(chat: types.Chat, user_id: int) -> bool:
+    """Fail closed for punishment: unknown membership never enables the strict newcomer rule."""
+    try:
+        member = await chat.get_member(user_id)
+        status = getattr(member.status, "value", str(member.status))
+        if status in {"creator", "administrator", "member"}:
+            return True
+        if status == "restricted":
+            return bool(getattr(member, "is_member", False))
+        return False
+    except Exception:
+        return False
+
+
 def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
     """Score combinations typical for unsolicited money/job/drug advertising."""
     whitelist = whitelist or []
@@ -93,6 +136,8 @@ def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
     if compact:
         value = _compact_text(text)
         has_link = any(token in value for token in ("http", "www", "tme"))
+        has_bot_handle = bool(re.search(r"[a-z0-9]{3,}bot$", value))
+        has_contact_handle = False
         has_cta = any(token in value for token in (
             "влс", "вличку", "пишитевлс", "напишивлс", "кидайплюс",
             "кидайте", "ставьплюс", "отклик",
@@ -108,6 +153,30 @@ def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
         has_work = any(token in value for token in (
             "вакансия", "подработка", "уборка", "заработок", "оплатавдень",
         ))
+        has_recruitment = any(token in value for token in (
+            "нуженчеловек", "нужнылюди", "нуженкурьер", "требуетсякурьер",
+            "требуютсясотрудники", "ищемлюдей", "ищукурьера", "набираемлюдей",
+        ))
+        has_earning_lure = any(token in value for token in (
+            "хочешьзарабатывать", "зарабатываймного", "высокийдоход",
+            "легкийзаработок", "деньгикаждыйдень", "платимсразу",
+        ))
+        has_cash_lure = any(token in value for token in (
+            "находноги", "беззалога", "аванссразу", "деньгисразу", "оплатасразу",
+        ))
+        logistics_hits = sum(token in value for token in (
+            "курьер", "проверятьадреса", "проверкаадресов", "устройства", "залог",
+        ))
+        has_suspicious_logistics = logistics_hits >= 2 or any(token in value for token in (
+            "проверятьадреса", "проверкаадресов",
+        ))
+        has_redirect = any(token in value for token in (
+            "заходисюда", "переходисюда", "жмисюда", "запускайбота",
+            "подробноститут", "ссылкавпрофиле",
+        ))
+        has_game_context = any(token in value for token in (
+            "вигре", "игровой", "монеты", "опыт", "дуэль", "цех", "ставка",
+        ))
         has_drug = any(token in value for token in (
             "закладка", "закладки", "меф", "шишки", "грамм",
         ))
@@ -115,6 +184,11 @@ def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
         has_link = bool(re.search(r"(?:https?://|www\.|t\.me/|\b[a-z0-9-]{2,}\.[a-z]{2,6}\b)", normalized))
         if has_link and any(item.lower() in normalized for item in whitelist):
             has_link = False
+        has_bot_handle = bool(re.search(r"@[a-z0-9_]{3,}bot\b", normalized, re.IGNORECASE))
+        has_contact_handle = bool(re.search(r"@[a-z0-9_]{4,}\b", normalized, re.IGNORECASE)) and not has_bot_handle
+        if any(item.lower() in normalized for item in whitelist):
+            has_bot_handle = False
+            has_contact_handle = False
         has_cta = bool(re.search(
             r"(?:\bв\s+(?:лс|личк\w*)\b|\b(?:на)?пиш\w*\b|"
             r"\bкида\w*\s*\+|\bстав\w*\s*\+|\bотклик\w*\b)",
@@ -139,20 +213,69 @@ def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
             r"оплата\s+(?:в|за)\s+день)\b",
             normalized,
         ))
+        has_recruitment = bool(re.search(
+            r"\b(?:(?:нужен|нужны|требуется|требуются|ищем|набираем)\s+"
+            r"(?:человек|люди|людей|курьер\w*|сотрудник\w*|работник\w*)|"
+            r"ищу\s+(?:человека|людей|курьера))\b",
+            normalized,
+        ))
+        has_earning_lure = bool(re.search(
+            r"\b(?:хочешь\s+(?:много\s+)?зарабатывать|зарабатывай\s+много|"
+            r"высокий\s+доход|легкий\s+заработок|деньги\s+каждый\s+день|"
+            r"(?:платим|оплата)\s+сразу)\b",
+            normalized,
+        ))
+        has_cash_lure = bool(re.search(
+            r"\b(?:на\s+ход\s+ноги|без\s+залог\w*|аванс\s+сразу|"
+            r"деньги\s+сразу|оплата\s+сразу)\b",
+            normalized,
+        ))
+        logistics_signals = (
+            bool(re.search(r"\bкурьер\w*\b", normalized)),
+            bool(re.search(r"\b(?:провер\w*\s+адрес\w*|адрес\w*\s+провер\w*)\b", normalized)),
+            bool(re.search(r"\bустройств\w*\b", normalized)),
+            bool(re.search(r"\bзалог\w*\b", normalized)),
+        )
+        has_suspicious_logistics = sum(logistics_signals) >= 2 or logistics_signals[1]
+        has_redirect = bool(re.search(
+            r"\b(?:заходи|переходи|жми|открывай|запускай)\s+(?:сюда|тут|бот\w*)|"
+            r"\b(?:подробности\s+(?:тут|здесь)|ссылка\s+в\s+профиле)\b",
+            normalized,
+        ))
+        has_game_context = bool(re.search(
+            r"\b(?:игр\w*|монет\w*|xp|опыт|дуэл\w*|цех|ставк\w*)\b",
+            normalized,
+        ))
         has_drug = bool(re.search(
             r"\b(?:закладк\w*|клад\w*|меф\w*|шишк\w*|грамм\w*)\b",
             normalized,
         ))
 
-    return sum((
+    score = sum((
         2 if has_link else 0,
+        3 if has_bot_handle else 0,
+        1 if has_contact_handle else 0,
         2 if has_cta else 0,
         2 if has_mass_offer else 0,
         2 if has_loan_offer else 0,
         2 if has_money else 0,
         2 if has_work else 0,
+        2 if has_recruitment else 0,
+        2 if has_earning_lure else 0,
+        3 if has_cash_lure else 0,
+        3 if has_suspicious_logistics else 0,
+        2 if has_redirect else 0,
         2 if has_drug else 0,
     ))
+    if has_game_context and not any((
+        has_money,
+        has_recruitment,
+        has_cash_lure,
+        has_suspicious_logistics,
+        has_drug,
+    )):
+        score = max(0, score - 4)
+    return score
 
 
 async def _delete_message_ids(bot: Bot, chat_id: int, message_ids) -> int:
@@ -203,6 +326,7 @@ class AutoModerationTracker:
         whitelist,
         is_reply: bool = False,
         user_xp: int = 0,
+        strict_newcomer: bool = False,
     ):
         now = time.time()
         key = (chat_id, user_id)
@@ -220,7 +344,8 @@ class AutoModerationTracker:
             and not is_reply
             and _is_short_loan_bait(normalized)
         )
-        if is_untrusted_loan_bait or _advertising_score(normalized, whitelist) >= 4 or (
+        is_direct_newcomer_action = strict_newcomer and _has_newcomer_action(normalized)
+        if is_direct_newcomer_action or is_untrusted_loan_bait or _advertising_score(normalized, whitelist) >= 4 or (
             len(recent_text) >= 2 and _advertising_score(combined, whitelist) >= 4
         ):
             return {"action": "advertising", "ids": [item["id"] for item in recent_text]}
@@ -318,7 +443,12 @@ class FloodMiddleware(BaseMiddleware):
         if event.from_user:
             user_data = await get_user(event.from_user.id, event.from_user.username, event.from_user.full_name)
             user_id = event.from_user.id
-            await track_recent_message(event.chat.id, user_id, event.message_id, int(event.date.timestamp()))
+            message_number = await track_recent_message(
+                event.chat.id,
+                user_id,
+                event.message_id,
+                int(event.date.timestamp()),
+            )
             is_adm = await is_admin(event.chat, user_id, event.sender_chat, required_level=LVL_HELPER)
             if is_adm:
                 return await handler(event, data)
@@ -326,6 +456,9 @@ class FloodMiddleware(BaseMiddleware):
             content = event.text or event.caption or f"[{event.content_type}]"
             badwords, whitelist = await asyncio.gather(get_list('badwords'), get_list('whitelist'))
             user_level = int(user_data[4] or 1) if user_data else 1
+            strict_newcomer = False
+            if user_level <= 1 and message_number <= 2 and not _is_channel_post_comment(event):
+                strict_newcomer = await _is_current_chat_member(event.chat, user_id)
             decision = auto_moderation.analyze(
                 event.chat.id,
                 user_id,
@@ -336,6 +469,7 @@ class FloodMiddleware(BaseMiddleware):
                 whitelist,
                 is_reply=event.reply_to_message is not None,
                 user_xp=int(user_data[3] or 0) if user_data else 0,
+                strict_newcomer=strict_newcomer,
             )
             action = decision["action"]
             if action == "allow":
