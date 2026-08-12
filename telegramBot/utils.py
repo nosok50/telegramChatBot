@@ -196,6 +196,28 @@ async def answer_persistent(
     return await message.answer(text, **kwargs)
 
 
+async def delete_temp_by_scope(
+    message: types.Message,
+    key: str = None,
+    global_key: str = None,
+    user_id: int = None,
+):
+    """Delete a tracked temporary message immediately and cancel its timer."""
+    chat_id = message.chat.id
+    scope_key = _scoped_key(message, key=key, global_key=global_key, user_id=user_id)
+    message_id = _active_temp_messages.pop(scope_key, None)
+    if not message_id:
+        return False
+
+    _cancel_delete_task(chat_id, message_id)
+    _message_meta.pop(_msg_key(chat_id, message_id), None)
+    try:
+        await message.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+    return True
+
+
 async def touch_temp_message(message: types.Message, delay: int = None):
     """
     Extends deletion timer for an already tracked temporary message.

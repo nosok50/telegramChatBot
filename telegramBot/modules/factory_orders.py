@@ -26,13 +26,36 @@ ORDER_SIZES = {
     "medium": (200_000, 2_000, 500),
     "large": (500_000, 5_000, 1_000),
 }
-TYPE_ALIASES = {"discussion": "discussion", "topic": "discussion", "обсуждение": "discussion",
-                "photo": "photo", "фото": "photo", "tournament": "tournament", "турнир": "tournament"}
-SIZE_ALIASES = {"small": "small", "малый": "small", "medium": "medium", "средний": "medium",
-                "large": "large", "большой": "large"}
+TYPE_ALIASES = {
+    "discussion": "discussion", "topic": "discussion",
+    "обсуждение": "discussion", "обсуждения": "discussion", "обсудить": "discussion",
+    "photo": "photo", "фото": "photo", "фотоконкурс": "photo",
+    "tournament": "tournament", "турнир": "tournament", "турнира": "tournament",
+}
+SIZE_ALIASES = {
+    "small": "small", "малый": "small", "маленький": "small",
+    "medium": "medium", "средний": "medium",
+    "large": "large", "большой": "large",
+}
 _processor_task = None
 _order_locks = defaultdict(asyncio.Lock)
 _chat_order_locks = defaultdict(asyncio.Lock)
+
+
+def parse_factory_order_args(raw_args: str):
+    args = (raw_args or "").split(maxsplit=2)
+    if len(args) < 2:
+        return None, None, "", "missing"
+    order_type = TYPE_ALIASES.get(args[0].casefold().strip())
+    size = SIZE_ALIASES.get(args[1].casefold().strip())
+    topic = args[2].strip() if len(args) > 2 else ""
+    if not order_type:
+        return None, size, topic, "type"
+    if not size:
+        return order_type, None, topic, "size"
+    if order_type != "tournament" and len(topic) < 5:
+        return order_type, size, topic, "topic"
+    return order_type, size, topic, None
 
 
 def build_factory_help_main(owner_id: int):
@@ -393,17 +416,25 @@ async def create_order(message: types.Message, command: CommandObject):
     await delete_later(message, 0)
     if message.chat.type == "private":
         return await answer_temp(message, "Заводской заказ запускается в общем чате, а не в личке.")
-    args = (command.args or "").split(maxsplit=2)
-    if len(args) < 2:
+    order_type, size, topic, parse_error = parse_factory_order_args(command.args)
+    if parse_error == "missing":
         text, kb = build_factory_help_main(message.from_user.id)
         return await answer_temp(message, text, reply_markup=kb, user_id=message.from_user.id)
-    order_type = TYPE_ALIASES.get(args[0].lower())
-    size = SIZE_ALIASES.get(args[1].lower())
-    topic = args[2].strip() if len(args) > 2 else ""
-    if not order_type or not size or (order_type != "tournament" and len(topic) < 5):
+    if parse_error:
+        error_text = {
+            "type": (
+                "Неизвестный тип заказа. Используйте "
+                "<code>обсуждение</code>, <code>фото</code> или <code>турнир</code>."
+            ),
+            "size": (
+                "Неизвестный размер заказа. Используйте "
+                "<code>малый</code>, <code>средний</code> или <code>большой</code>."
+            ),
+            "topic": "После типа и размера напишите тему длиной хотя бы 5 символов.",
+        }[parse_error]
         return await answer_temp(
             message,
-            "Не удалось разобрать команду.\n\n"
+            f"⚠️ {error_text}\n\n"
             "Пример:\n"
             "<code>/factory_order</code> <code>обсуждение</code> "
             "<code>малый</code> <code>Ваша тема</code>",

@@ -90,6 +90,29 @@ class ProgressionTests(unittest.IsolatedAsyncioTestCase):
             )).fetchone()
         return row
 
+    def test_factory_command_accepts_natural_russian_form(self):
+        parsed = factory_orders.parse_factory_order_args(
+            "обсуждения малый я(zeariar) нормальный модератор?"
+        )
+        self.assertEqual(
+            parsed,
+            ("discussion", "small", "я(zeariar) нормальный модератор?", None),
+        )
+
+    def test_factory_command_reports_exact_bad_argument(self):
+        self.assertEqual(
+            factory_orders.parse_factory_order_args("болтовня малый Нормальная тема")[3],
+            "type",
+        )
+        self.assertEqual(
+            factory_orders.parse_factory_order_args("обсуждение огромный Нормальная тема")[3],
+            "size",
+        )
+        self.assertEqual(
+            factory_orders.parse_factory_order_args("обсуждение малый нет")[3],
+            "topic",
+        )
+
     async def complete_farm(self, user_id, coins=60000):
         async with aiosqlite.connect(self.db) as db:
             await db.execute(

@@ -15,6 +15,7 @@ from database import (
     farm_adjust_coins,
     track_recent_message, get_recent_message_ids,
     mark_recent_messages_deleted,
+    is_human_verification_pending,
 )
 from utils import (
     answer_temp, answer_persistent, get_user_link, delete_later,
@@ -76,11 +77,32 @@ def _compact_text(text: str) -> str:
     return re.sub(r"[^a-zа-я0-9]+", "", _plain_text(text))
 
 
+def _message_urls(message: types.Message):
+    """Return URLs hidden behind Telegram text-link entities."""
+    entities = message.entities if message.text else message.caption_entities
+    urls = []
+    for entity in entities or []:
+        entity_type = getattr(entity.type, "value", str(entity.type))
+        url = getattr(entity, "url", None)
+        if entity_type == "text_link" and url:
+            urls.append(str(url))
+    return urls
+
+
+def _message_content_for_analysis(message: types.Message) -> str:
+    visible = message.text or message.caption or f"[{message.content_type}]"
+    hidden_urls = _message_urls(message)
+    if not hidden_urls:
+        return visible
+    return f"{visible} {' '.join(hidden_urls)}"
+
+
 def _is_short_loan_bait(text: str) -> bool:
     """Catch standalone loan bait without treating normal conversation as advertising."""
     value = _compact_text(text)
     return bool(re.fullmatch(
-        r"(?:дамвдолг|даювдолг|выдамвдолг|дамзайм|выдамзайм|одолжуденьги)\d*",
+        r"(?:дамвдолг|даювдолг|выдамвдолг|дамзайм|выдамзайм|одолжуденьги)"
+        r"(?:сейчас|сегодня|быстро|срочно|моментально|безотказа)?\d*",
         value,
     ))
 
@@ -149,7 +171,11 @@ def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
             "дамвдолг", "даювдолг", "выдамвдолг", "дамзайм",
             "выдамзайм", "одолжуденьги",
         ))
-        has_money = bool(re.search(r"\d{2,}(руб|рублей|₽|вдень|задень|засмену)", value))
+        has_money = bool(re.search(
+            r"(?:\d{2,}(?:руб|рублей|₽|вдень|задень|засмену)|"
+            r"\d+(?:usdt|usdc|btc|eth|ton))",
+            value,
+        ))
         has_work = any(token in value for token in (
             "вакансия", "подработка", "уборка", "заработок", "оплатавдень",
         ))
@@ -205,7 +231,8 @@ def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
             normalized,
         ))
         has_money = bool(re.search(
-            r"(?:\b\d{2,}\s*(?:руб\w*|₽)|\b\d{3,}\s*(?:в|за)\s*(?:день|смену))",
+            r"(?:\b\d{2,}\s*(?:руб\w*|₽)|\b\d{3,}\s*(?:в|за)\s*(?:день|смену)|"
+            r"\b\d+(?:[.,]\d+)?\s*(?:usdt|usdc|btc|eth|ton)\b)",
             normalized,
         ))
         has_work = bool(re.search(
@@ -348,7 +375,11 @@ class AutoModerationTracker:
         if is_direct_newcomer_action or is_untrusted_loan_bait or _advertising_score(normalized, whitelist) >= 4 or (
             len(recent_text) >= 2 and _advertising_score(combined, whitelist) >= 4
         ):
-            return {"action": "advertising", "ids": [item["id"] for item in recent_text]}
+            return {
+                "action": "advertising",
+                "ids": [item["id"] for item in recent_text],
+                "kick_newcomer": bool(strict_newcomer),
+            }
 
         short_parts = []
         for item in reversed(history):
@@ -365,7 +396,11 @@ class AutoModerationTracker:
             if len(short_parts) >= 3 and _advertising_score(joined_short, whitelist, compact=True) >= 4:
                 ids = [item["id"] for item in short_parts]
                 self._remove_ids(key, ids)
-                return {"action": "advertising", "ids": ids}
+                return {
+                    "action": "advertising",
+                    "ids": ids,
+                    "kick_newcomer": bool(strict_newcomer),
+                }
 
         letter_parts = []
         for item in reversed(history):
@@ -440,7 +475,24 @@ class FloodMiddleware(BaseMiddleware):
         if event.chat.type == 'private':
             return await handler(event, data)
 
+        if event.content_type in {ContentType.NEW_CHAT_MEMBERS, ContentType.LEFT_CHAT_MEMBER}:
+            return await handler(event, data)
+
         if event.from_user:
+            # Service messages must reach the join/leave handlers. Every ordinary
+            # message from an unverified newcomer stops here, before XP/activity.
+            if await is_human_verification_pending(event.chat.id, event.from_user.id):
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                await answer_temp(
+                    event,
+                    "🧩 Сначала нажмите кнопку <b>«Я человек»</b> в приветственном сообщении.",
+                    key=f"human_verification:{event.from_user.id}",
+                )
+                return
+
             user_data = await get_user(event.from_user.id, event.from_user.username, event.from_user.full_name)
             user_id = event.from_user.id
             message_number = await track_recent_message(
@@ -453,7 +505,7 @@ class FloodMiddleware(BaseMiddleware):
             if is_adm:
                 return await handler(event, data)
 
-            content = event.text or event.caption or f"[{event.content_type}]"
+            content = _message_content_for_analysis(event)
             badwords, whitelist = await asyncio.gather(get_list('badwords'), get_list('whitelist'))
             user_level = int(user_data[4] or 1) if user_data else 1
             strict_newcomer = False
@@ -484,10 +536,24 @@ class FloodMiddleware(BaseMiddleware):
                         permissions=ChatPermissions(can_send_messages=False),
                         until_date=int(time.time()) + 24 * 60 * 60,
                     )
-                    await answer_persistent(
+                    if decision.get("kick_newcomer"):
+                        await event.chat.ban(user_id=user_id)
+                        await event.chat.unban(user_id)
+                        notice = (
+                            f"🚪 {user_link} автоматически исключён из чата,\n"
+                            f"причина: <i>Рекламный спам сразу после входа</i>. "
+                            f"Удалено сообщений: <b>{deleted}</b>."
+                        )
+                    else:
+                        notice = (
+                            f"🔇 {user_link} получил блокировку чата на <b>24 часа</b>,\n"
+                            f"причина: <i>Рекламный спам</i>. Удалено сообщений: <b>{deleted}</b>."
+                        )
+                    await answer_temp(
                         event,
-                        f"🔇 {user_link} получил блокировку чата на <b>24 часа</b>,\n"
-                        f"причина: <i>Рекламный спам</i>. Удалено сообщений: <b>{deleted}</b>.",
+                        notice,
+                        delay=120,
+                        key=f"auto_punishment:{user_id}",
                     )
                 except Exception as error:
                     await answer_temp(event, f"Ошибка автомодерации: {error}")
@@ -503,16 +569,20 @@ class FloodMiddleware(BaseMiddleware):
                         until_date=int(time.time()) + 30 * 60,
                     )
                     await manage_warn(user_id, "reset")
-                    await answer_persistent(
+                    await answer_temp(
                         event,
                         f"🔇 {user_link} получил блокировку чата на <b>30 мин</b>,\n"
                         f"причина: <i>Запрещенное слово, разбитое на сообщения</i>.",
+                        delay=120,
+                        key=f"auto_punishment:{user_id}",
                     )
                 else:
-                    await answer_persistent(
+                    await answer_temp(
                         event,
                         f"⚠️ {user_link} получил предупреждение ({current_warns}/{WARN_LIMIT}),\n"
                         f"причина: <i>Запрещенное слово, разбитое на сообщения</i>.",
+                        delay=120,
+                        key=f"auto_punishment:{user_id}",
                     )
                 return
 
@@ -527,10 +597,12 @@ class FloodMiddleware(BaseMiddleware):
                     permissions=ChatPermissions(can_send_messages=False),
                     until_date=int(time.time()) + 10 * 60,
                 )
-                await answer_persistent(
+                await answer_temp(
                     event,
                     f"🔇 {user_link} получил блокировку чата на <b>10 мин</b>,\n"
                     f"причина: <i>{decision['reason']}</i>.",
+                    delay=120,
+                    key=f"auto_punishment:{user_id}",
                 )
             except Exception as error:
                 await answer_temp(event, f"Ошибка автомодерации: {error}")
@@ -552,7 +624,8 @@ async def bad_content_checker(message: types.Message) -> Union[bool, Dict[str, A
     is_adm = await is_admin(message.chat, user_id, message.sender_chat, required_level=LVL_HELPER)
     if is_adm: return False
 
-    text_to_analyze = message.text or message.caption or ""
+    visible_text = message.text or message.caption or ""
+    text_to_analyze = _message_content_for_analysis(message)
     if not text_to_analyze: return False
     
     reason = None
@@ -578,7 +651,7 @@ async def bad_content_checker(message: types.Message) -> Union[bool, Dict[str, A
             reason = "Реклама / Ссылки"
 
     # Маты
-    if not reason and text_analyzer.is_bad_word(text_to_analyze, badwords):
+    if not reason and text_analyzer.is_bad_word(visible_text, badwords):
         reason = "Запрещенное слово"
 
     if reason:
@@ -610,17 +683,21 @@ async def handle_bad_content(message: types.Message, reason: str):
             )
             await manage_warn(user_id, "reset")
             # ИЗМЕНЕНО: СЛЕНГ УБРАН, ДОБАВЛЕНО ФОРМАТИРОВАНИЕ
-            await answer_persistent(message,
+            await answer_temp(message,
                 f"🔇 {user_link_html} получил блокировку чата на <b>30 мин</b>,\n"
-                f"причина: <i>{reason}</i> (Лимит предупреждений)."
+                f"причина: <i>{reason}</i> (Лимит предупреждений).",
+                delay=120,
+                key=f"auto_punishment:{user_id}",
             )
         except Exception as e:
             await answer_temp(message, f"Ошибка при выдаче наказания: {e}")
     else:
         # ИЗМЕНЕНО: СЛЕНГ УБРАН, ДОБАВЛЕНО ФОРМАТИРОВАНИЕ
-        await answer_persistent(message,
+        await answer_temp(message,
             f"⚠️ {user_link_html} получил предупреждение ({current_warns}/{WARN_LIMIT}),\n"
-            f"причина: <i>{reason}</i>."
+            f"причина: <i>{reason}</i>.",
+            delay=120,
+            key=f"auto_punishment:{user_id}",
         )
 
 

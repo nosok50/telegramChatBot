@@ -64,7 +64,7 @@ SYNCABLE_TABLES = [
     "farm_players", "farm_cells", "month_scores", "month_results",
     "duel_history", "active_duels", "factory_orders",
     "factory_order_participants", "factory_order_messages", "factory_order_votes",
-    "chat_level_tags", "data_migrations",
+    "chat_level_tags", "human_verifications", "data_migrations",
 ]
 
 MONTH_PRIZES = (10000, 5000, 2500)
@@ -80,6 +80,7 @@ EXTRA_SYNC_COLUMNS = {
     "factory_order_messages": ("order_id", "message_id", "author_id", "parent_author_id"),
     "factory_order_votes": ("order_id", "voter_id", "candidate_id"),
     "chat_level_tags": ("chat_id", "user_id", "applied_level", "retry_after", "last_error"),
+    "human_verifications": ("chat_id", "user_id", "welcome_message_id", "joined_at"),
     "data_migrations": ("migration_key", "applied_at"),
 }
 
@@ -440,6 +441,13 @@ async def _ensure_neon_schema():
                 applied_level INTEGER DEFAULT 0,
                 retry_after BIGINT DEFAULT 0,
                 last_error TEXT DEFAULT '',
+                PRIMARY KEY(chat_id,user_id)
+            );
+            CREATE TABLE IF NOT EXISTS human_verifications (
+                chat_id BIGINT,
+                user_id BIGINT,
+                welcome_message_id BIGINT,
+                joined_at BIGINT NOT NULL,
                 PRIMARY KEY(chat_id,user_id)
             );
             CREATE TABLE IF NOT EXISTS data_migrations (
@@ -1129,6 +1137,13 @@ async def create_tables():
             last_error TEXT DEFAULT '',
             PRIMARY KEY (chat_id, user_id)
         )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS human_verifications (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            welcome_message_id INTEGER,
+            joined_at INTEGER NOT NULL,
+            PRIMARY KEY (chat_id, user_id)
+        )''')
         await db.execute('''CREATE TABLE IF NOT EXISTS data_migrations (
             migration_key TEXT PRIMARY KEY,
             applied_at INTEGER NOT NULL
@@ -1216,6 +1231,79 @@ async def track_recent_message(chat_id: int, user_id: int, message_id: int, crea
         row = await cursor.fetchone()
         await db.commit()
         return int(row[0]) if row else 1
+
+
+async def set_human_verification_pending(
+    chat_id: int,
+    user_id: int,
+    joined_at: int = None,
+):
+    """Require a newly joined member to press their personal verification button."""
+    timestamp = int(joined_at or time.time())
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            '''SELECT welcome_message_id FROM human_verifications
+               WHERE chat_id = ? AND user_id = ?''',
+            (chat_id, user_id),
+        )
+        old_row = await cursor.fetchone()
+        await db.execute(
+            '''INSERT INTO human_verifications
+               (chat_id, user_id, welcome_message_id, joined_at)
+               VALUES (?, ?, NULL, ?)
+               ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                   welcome_message_id = NULL,
+                   joined_at = excluded.joined_at''',
+            (chat_id, user_id, timestamp),
+        )
+        await db.commit()
+    await _mark_dirty("human_verifications")
+    return old_row[0] if old_row and old_row[0] else None
+
+
+async def set_human_verification_message(chat_id: int, user_id: int, message_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            '''UPDATE human_verifications SET welcome_message_id = ?
+               WHERE chat_id = ? AND user_id = ?''',
+            (message_id, chat_id, user_id),
+        )
+        await db.commit()
+    if cursor.rowcount:
+        await _mark_dirty("human_verifications")
+    return bool(cursor.rowcount)
+
+
+async def is_human_verification_pending(chat_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            '''SELECT 1 FROM human_verifications
+               WHERE chat_id = ? AND user_id = ?''',
+            (chat_id, user_id),
+        )
+        return await cursor.fetchone() is not None
+
+
+async def complete_human_verification(chat_id: int, user_id: int):
+    """Remove the pending gate and return its welcome message id, if it existed."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            '''SELECT welcome_message_id FROM human_verifications
+               WHERE chat_id = ? AND user_id = ?''',
+            (chat_id, user_id),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            await db.rollback()
+            return False, None
+        await db.execute(
+            'DELETE FROM human_verifications WHERE chat_id = ? AND user_id = ?',
+            (chat_id, user_id),
+        )
+        await db.commit()
+    await _mark_dirty("human_verifications")
+    return True, row[0]
 
 
 async def get_recent_message_ids(

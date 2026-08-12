@@ -9,6 +9,8 @@ from database import (
     get_free_dice_remaining, claim_free_dice,
     register_sync_activity,
     get_month_score, get_month_leaders, get_month_wins, get_previous_month_title,
+    set_human_verification_pending, set_human_verification_message,
+    complete_human_verification,
 )
 from engagement import process_chat_activity
 from level_tags import ensure_level_tag
@@ -17,6 +19,7 @@ from config import WARN_LIMIT, OWNER_ID
 from utils import (
     delete_later,
     answer_temp,
+    delete_temp_by_scope,
     get_user_link,
     bump_sticky_message_counter,
     replace_sticky_message,
@@ -71,6 +74,11 @@ async def get_effective_level(user_id: int, chat: types.Chat, db_level: int, sen
 def format_xp(value):
     """Форматирует число с пробелами (10 000)"""
     return "{:,}".format(value).replace(",", " ")
+
+
+def can_view_foreign_profile(game_level: int, moderator_level: int) -> bool:
+    """Foreign profiles unlock through either game progress or staff rights."""
+    return int(game_level or 0) >= 4 or int(moderator_level or 0) >= 2
 
 
 def format_month_key(key: str) -> str:
@@ -388,8 +396,11 @@ async def show_profile(message: types.Message, command: CommandObject = None):
     is_foreign_request = (cmd_args is not None and cmd_args.strip()) or message.reply_to_message
 
     if is_foreign_request:
-        if effective_level < 4 and lvl < 4:
-            return await answer_temp(message, "⛔ Просмотр чужих профилей доступен с <b>4 уровня</b>.")
+        if not can_view_foreign_profile(lvl, effective_level):
+            return await answer_temp(
+                message,
+                "⛔ Просмотр чужих профилей доступен с <b>4 игрового уровня</b> или ранга <b>Moder²</b>.",
+            )
         
         if cmd_args:
             username_arg = cmd_args.split()[0].replace("@", "")
@@ -772,25 +783,111 @@ async def on_user_join(message: types.Message):
     except Exception:
         pass
 
-    new_user = message.new_chat_members[0]
-    welcome_text = (
-        f"🧩 Привет, {new_user.mention_html()}!\n\n"
-        f"Здесь можно обсудить посты с канала, поделиться мыслями и задать вопросы, которые появились по ходу чтения. Несколько простых правил:\n\n"
-        f"🚫 <b>Без спама и лишнего флуда</b> — только интересные обсуждения.\n\n"
-        f"💬 <b>Уважай других участников</b>, ведь каждый здесь из любви к играм и их созданию.\n\n"
-        f"<i>Приятного общения, и добро пожаловать в наше сообщество!</i> 🎮"
+    for new_user in message.new_chat_members:
+        if new_user.is_bot:
+            continue
+
+        old_welcome_id = await set_human_verification_pending(
+            message.chat.id,
+            new_user.id,
+            int(message.date.timestamp()),
+        )
+        if old_welcome_id:
+            try:
+                await message.bot.delete_message(message.chat.id, old_welcome_id)
+            except Exception:
+                pass
+
+        welcome_text = (
+            f"🧩 Привет, {new_user.mention_html()}!\n\n"
+            f"Здесь можно обсудить посты с канала, поделиться мыслями и задать вопросы, которые появились по ходу чтения. Несколько простых правил:\n\n"
+            f"🚫 <b>Без спама и лишнего флуда</b> — только интересные обсуждения.\n\n"
+            f"💬 <b>Уважай других участников</b>, ведь каждый здесь из любви к играм и их созданию.\n\n"
+            f"Нажми <b>«Я человек»</b>, чтобы получить возможность писать в чат."
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="✅ Я человек",
+            callback_data=f"human_verify:{new_user.id}",
+        )]])
+
+        sent = None
+        try:
+            sent = await message.answer_photo(
+                photo=IMG_WELCOME,
+                caption=welcome_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            try:
+                sent = await message.answer(
+                    welcome_text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                )
+            except Exception as error:
+                await complete_human_verification(message.chat.id, new_user.id)
+                print(f"Ошибка при отправке приветствия: {error}")
+                continue
+
+        stored = await set_human_verification_message(
+            message.chat.id,
+            new_user.id,
+            sent.message_id,
+        )
+        if not stored:
+            try:
+                await sent.delete()
+            except Exception:
+                pass
+
+
+@router.callback_query(F.data.startswith("human_verify:"))
+async def confirm_human(callback: CallbackQuery):
+    try:
+        expected_user_id = int(callback.data.split(":", 1)[1])
+    except (TypeError, ValueError):
+        return await callback.answer("Некорректная кнопка.", show_alert=True)
+
+    if callback.from_user.id != expected_user_id:
+        return await callback.answer("Эта кнопка предназначена другому пользователю.", show_alert=True)
+
+    completed, welcome_message_id = await complete_human_verification(
+        callback.message.chat.id,
+        expected_user_id,
     )
+    await delete_temp_by_scope(
+        callback.message,
+        key=f"human_verification:{expected_user_id}",
+    )
+    if not completed:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        return await callback.answer("Вы уже подтвердили вход.")
 
     try:
-        await answer_temp(
-            message,
-            text=welcome_text,
-            photo=IMG_WELCOME,
-            parse_mode="HTML",
-            global_key="welcome_message",
-        )
-    except Exception as e:
-        print(f"Ошибка при отправке приветствия: {e}")
+        await callback.bot.delete_message(callback.message.chat.id, welcome_message_id or callback.message.message_id)
+    except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+    await callback.answer("Готово. Теперь можно писать в чат.")
+
+
+@router.message(F.left_chat_member)
+async def on_user_leave(message: types.Message):
+    left_user = message.left_chat_member
+    if not left_user or left_user.is_bot:
+        return
+    completed, welcome_message_id = await complete_human_verification(message.chat.id, left_user.id)
+    if completed and welcome_message_id:
+        try:
+            await message.bot.delete_message(message.chat.id, welcome_message_id)
+        except Exception:
+            pass
 
 
 # --- ОСНОВНОЙ ХЕНДЛЕР ТЕКСТА (ФАРМ XP + REP) ---
