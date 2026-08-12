@@ -90,7 +90,9 @@ def _message_urls(message: types.Message):
 
 
 def _message_content_for_analysis(message: types.Message) -> str:
-    visible = message.text or message.caption or f"[{message.content_type}]"
+    # Media without a caption has no text to analyze. Do not substitute the
+    # enum name (for example, "ContentType.PHOTO"): its dot looks like a URL.
+    visible = message.text or message.caption or ""
     hidden_urls = _message_urls(message)
     if not hidden_urls:
         return visible

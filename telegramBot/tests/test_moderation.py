@@ -18,6 +18,18 @@ import utils
 
 
 class ModerationTests(unittest.IsolatedAsyncioTestCase):
+    def test_photo_without_caption_is_not_treated_as_a_link(self):
+        message = SimpleNamespace(
+            text=None,
+            caption=None,
+            content_type="ContentType.PHOTO",
+            entities=None,
+            caption_entities=None,
+        )
+        content = _message_content_for_analysis(message)
+        self.assertEqual(content, "")
+        self.assertEqual(_advertising_score(content), 0)
+
     async def test_human_verification_reminder_can_be_deleted_before_timer(self):
         chat_id = -1001
         message_id = 99
