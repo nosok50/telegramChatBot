@@ -107,7 +107,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         with patch("modules.user.get_human_verification", AsyncMock(return_value=None)):
             await confirm_human(callback)
         callback.answer.assert_awaited_once_with(
-            "Эта проверка предназначена другому пользователю.",
+            text="Эта проверка предназначена другому пользователю.",
             show_alert=True,
         )
 
@@ -138,7 +138,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         ):
             await confirm_human(callback)
 
-        complete.assert_awaited_once_with(-1001, 42)
+        complete.assert_awaited_once_with(-1001, 42, challenge_token="private-token")
         callback.bot.delete_message.assert_awaited_once_with(-1001, 777)
         answer_temp.assert_awaited_once()
         self.assertIn("Здесь можно обсудить посты с канала", answer_temp.await_args.args[1])
@@ -147,7 +147,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
             "https://i.ibb.co/Q3GG72fN/Frame-26085986.png",
         )
         self.assertEqual(answer_temp.await_args.kwargs["delay"], 120)
-        callback.answer.assert_awaited_once_with("Проверка пройдена. Теперь можно писать в чат.")
+        callback.answer.assert_awaited_once_with()
 
     def test_photo_without_caption_is_not_treated_as_a_link(self):
         message = SimpleNamespace(

@@ -15,6 +15,8 @@ from database import (
     complete_human_verification, get_human_verification,
     get_pending_human_verifications, update_human_verification_input,
     fail_human_verification_attempt,
+    get_chat_verification_access, migrate_existing_chat_access,
+    revoke_chat_verification_access,
 )
 from engagement import process_chat_activity
 from level_tags import ensure_level_tag
@@ -34,8 +36,12 @@ import time
 import asyncio
 import io
 import secrets
+import random
+import logging
 from datetime import datetime
+from contextlib import nullcontext
 from PIL import Image, ImageDraw, ImageFont
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 router = Router()
 
@@ -57,6 +63,15 @@ CAPTCHA_TTL_SECONDS = 180
 CAPTCHA_MAX_ATTEMPTS = 3
 _captcha_timeout_tasks = {}
 _captcha_random = secrets.SystemRandom()
+_captcha_locks = {}
+_captcha_view_tasks = {}
+_captcha_views = {}
+_captcha_view_next_at = {}
+_verification_log = logging.getLogger("human_verification")
+
+
+def _captcha_lock(chat_id: int, user_id: int):
+    return _captcha_locks.setdefault((chat_id, user_id), asyncio.Lock())
 
 
 def _captcha_task_key(chat_id: int, user_id: int):
@@ -64,14 +79,21 @@ def _captcha_task_key(chat_id: int, user_id: int):
 
 
 def _cancel_captcha_timeout(chat_id: int, user_id: int):
-    task = _captcha_timeout_tasks.pop(_captcha_task_key(chat_id, user_id), None)
+    key = _captcha_task_key(chat_id, user_id)
+    view_task = _captcha_view_tasks.pop(key, None)
+    _captcha_views.pop(key, None)
+    _captcha_view_next_at.pop(key, None)
+    if view_task and not view_task.done():
+        view_task.cancel()
+    task = _captcha_timeout_tasks.pop(key, None)
     if task and not task.done() and task is not asyncio.current_task():
         task.cancel()
 
 
 def _captcha_keyboard(token: str) -> InlineKeyboardMarkup:
     digits = list("0123456789")
-    _captcha_random.shuffle(digits)
+    # Keep the original shuffled layout fixed throughout one challenge.
+    random.Random(token).shuffle(digits)
     rows = [
         [InlineKeyboardButton(text=digit, callback_data=f"captcha:{token}:digit:{digit}")
          for digit in digits[index:index + 5]]
@@ -139,14 +161,78 @@ def build_captcha_png(code: str) -> bytes:
     return output.getvalue()
 
 
-def _captcha_caption(user_mention: str, attempts: int = 0) -> str:
+def _captcha_caption(user_mention: str, attempts: int = 0, entered: str = "", notice: str = "") -> str:
     remaining = CAPTCHA_MAX_ATTEMPTS - attempts
+    entered = entered[:CAPTCHA_LENGTH]
+    slots = " ".join(list(entered) + ["□"] * (CAPTCHA_LENGTH - len(entered)))
+    notice_text = f"{notice}\n" if notice else ""
+    attempts_text = f"Осталось попыток: <b>{remaining}</b>.\n" if attempts > 0 else ""
     return (
         f"🧩 Привет, {user_mention}!\n\n"
-        f"Чтобы писать в чат, введи <b>{CAPTCHA_LENGTH} цифр с картинки</b> кнопками ниже.\n"
-        f"Проверка действует <b>3 минуты</b>. Попыток: <b>{remaining}</b>.\n\n"
-        f"Никуда переходить и регистрироваться не нужно."
+        f"Набери <b>{CAPTCHA_LENGTH} цифр с картинки</b> кнопками ниже и нажми <b>«Готово»</b>.\n\n"
+        f"На проверку — 3 минуты.\n"
+        f"{attempts_text}\n"
+        f"{notice_text}"
+        f"<b>Твой ввод:</b> <code>{slots}</code>"
     )
+
+
+def _schedule_captcha_view(callback, token: str, notice: str = ""):
+    """Coalesce rapid keypresses; rendering never blocks input processing."""
+    key = _captcha_task_key(callback.message.chat.id, callback.from_user.id)
+    _captcha_views[key] = (callback, token, notice)
+    task = _captcha_view_tasks.get(key)
+    if task is None or task.done():
+        _captcha_view_tasks[key] = asyncio.create_task(_render_captcha_view(key))
+
+
+async def _render_captcha_view(key):
+    last_caption = None
+    try:
+        await asyncio.sleep(0.15)
+        while key in _captcha_views:
+            await asyncio.sleep(max(0, _captcha_view_next_at.get(key, 0) - time.monotonic()))
+            snapshot = _captcha_views[key]
+            callback, token, notice = snapshot
+            pending = await get_human_verification(*key)
+            if not pending or pending.get("challenge_token") != token:
+                return
+            caption = _captcha_caption(
+                callback.from_user.mention_html(),
+                int(pending.get("attempts") or 0),
+                pending.get("entered_code") or "",
+                notice,
+            )
+            if caption != last_caption:
+                try:
+                    _captcha_view_next_at[key] = time.monotonic() + 1
+                    await callback.bot.edit_message_caption(
+                        chat_id=key[0],
+                        message_id=pending["welcome_message_id"],
+                        caption=caption,
+                        parse_mode="HTML",
+                        reply_markup=_captcha_keyboard(token),
+                    )
+                except TelegramRetryAfter as error:
+                    await asyncio.sleep(error.retry_after)
+                    continue
+                except TelegramBadRequest as error:
+                    if "message is not modified" not in str(error).lower():
+                        _verification_log.warning("captcha_view_failed chat=%s user=%s: %s", *key, error)
+                        return
+                last_caption = caption
+            # A newer keypress may have arrived while Telegram was updating the screen.
+            if _captcha_views.get(key) is snapshot:
+                return
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        _verification_log.exception("captcha_view_failed chat=%s user=%s", *key)
+    finally:
+        if _captcha_view_tasks.get(key) is asyncio.current_task():
+            _captcha_view_tasks.pop(key, None)
+            _captcha_views.pop(key, None)
 
 
 def _verified_welcome_text(user: types.User) -> str:
@@ -164,6 +250,7 @@ async def _kick_after_failed_captcha(bot, chat_id: int, user_id: int, message_id
         await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
         await bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
     except Exception:
+        _verification_log.exception("captcha_kick_failed chat=%s user=%s", chat_id, user_id)
         return False
 
     await complete_human_verification(chat_id, user_id)
@@ -179,15 +266,13 @@ async def _kick_after_failed_captcha(bot, chat_id: int, user_id: int, message_id
 async def _captcha_timeout(bot, chat_id: int, user_id: int, token: str, expires_at: int):
     try:
         await asyncio.sleep(max(0, expires_at - int(time.time())))
-        pending = await get_human_verification(chat_id, user_id)
-        if not pending or pending["challenge_token"] != token:
-            return
-        await _kick_after_failed_captcha(
-            bot,
-            chat_id,
-            user_id,
-            pending.get("welcome_message_id"),
-        )
+        async with _captcha_lock(chat_id, user_id):
+            pending = await get_human_verification(chat_id, user_id)
+            if not pending or pending["challenge_token"] != token:
+                return
+            await _kick_after_failed_captcha(
+                bot, chat_id, user_id, pending.get("welcome_message_id"),
+            )
     except asyncio.CancelledError:
         return
     finally:
@@ -204,10 +289,11 @@ def _schedule_captcha_timeout(bot, chat_id: int, user_id: int, token: str, expir
 
 async def start_human_verification_processor(bot):
     """Restore CAPTCHA expiry timers after a bot restart."""
+    await migrate_existing_chat_access()
     for pending in await get_pending_human_verifications():
         token = pending.get("challenge_token") or ""
         if not token:
-            # One-time cleanup for obsolete single-button challenges.
+            # Replace obsolete challenges; deleting their state must not grant access.
             if pending.get("welcome_message_id"):
                 try:
                     await bot.delete_message(
@@ -217,6 +303,11 @@ async def start_human_verification_processor(bot):
                 except Exception:
                     pass
             await complete_human_verification(pending["chat_id"], pending["user_id"])
+            await begin_human_verification(
+                bot, types.Chat(id=pending["chat_id"], type="supergroup"),
+                types.User(id=pending["user_id"], first_name="Участник", is_bot=False),
+                source="legacy_challenge",
+            )
             continue
         _schedule_captcha_timeout(
             bot,
@@ -956,33 +1047,35 @@ async def cmd_wipe(message: types.Message):
         await answer_temp(message, f"❌ Не удалось удалить: {e}")
 
 
-# --- ПРИВЕТСТВИЕ ---
-@router.message(F.new_chat_members)
-async def on_user_join(message: types.Message):
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    for new_user in message.new_chat_members:
-        if new_user.is_bot:
-            continue
-
+# --- ПРИВЕТСТВИЕ И ВСЕ ПУТИ ВХОДА ---
+async def begin_human_verification(
+    bot, chat, new_user, joined_at=None, *, source="message_fallback", _lock_held=False,
+):
+    if new_user.is_bot:
+        return
+    async with (nullcontext() if _lock_held else _captcha_lock(chat.id, new_user.id)):
+        pending = await get_human_verification(chat.id, new_user.id)
+        access = await get_chat_verification_access(chat.id, new_user.id)
+        # A join can arrive as both a service message and a chat_member update.
+        # A fallback message can also race them. Preserve a single challenge.
+        if pending and (joined_at is None or int(pending["joined_at"]) >= joined_at):
+            if pending.get("welcome_message_id"):
+                return
+        if access and (joined_at is None or int(access["joined_at"]) >= joined_at):
+            return
         challenge_code = "".join(_captcha_random.choice("23456789") for _ in range(CAPTCHA_LENGTH))
         challenge_token = secrets.token_urlsafe(6)
         expires_at = int(time.time()) + CAPTCHA_TTL_SECONDS
         old_welcome_id = await set_human_verification_pending(
-            message.chat.id,
-            new_user.id,
-            int(message.date.timestamp()),
+            chat.id, new_user.id, joined_at,
             challenge_token=challenge_token,
             challenge_code=challenge_code,
             expires_at=expires_at,
         )
-        _cancel_captcha_timeout(message.chat.id, new_user.id)
+        _cancel_captcha_timeout(chat.id, new_user.id)
         if old_welcome_id:
             try:
-                await message.bot.delete_message(message.chat.id, old_welcome_id)
+                await bot.delete_message(chat.id, old_welcome_id)
             except Exception:
                 pass
 
@@ -991,7 +1084,8 @@ async def on_user_join(message: types.Message):
 
         sent = None
         try:
-            sent = await message.answer_photo(
+            sent = await bot.send_photo(
+                chat_id=chat.id,
                 photo=BufferedInputFile(
                     build_captcha_png(challenge_code),
                     filename="human-check.png",
@@ -1000,20 +1094,15 @@ async def on_user_join(message: types.Message):
                 parse_mode="HTML",
                 reply_markup=keyboard,
             )
-        except Exception as error:
-            try:
-                await message.answer(
-                    f"⚠️ Не удалось создать проверку для {new_user.mention_html()}. "
-                    f"Обратитесь к модератору.",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-            print(f"Ошибка при отправке CAPTCHA: {error}")
-            continue
+        except Exception:
+            _verification_log.exception(
+                "captcha_send_failed chat=%s user=%s source=%s", chat.id, new_user.id, source,
+            )
+            # Keep the pending record. The next message retries delivery, never grants access.
+            return
 
         stored = await set_human_verification_message(
-            message.chat.id,
+            chat.id,
             new_user.id,
             sent.message_id,
         )
@@ -1022,28 +1111,78 @@ async def on_user_join(message: types.Message):
                 await sent.delete()
             except Exception:
                 pass
-            continue
+            return
         _schedule_captcha_timeout(
-            message.bot,
-            message.chat.id,
+            bot,
+            chat.id,
             new_user.id,
             challenge_token,
             expires_at,
         )
+        _verification_log.info(
+            "captcha_created chat=%s user=%s source=%s message=%s",
+            chat.id, new_user.id, source, sent.message_id,
+        )
+
+
+@router.message(F.new_chat_members)
+async def on_user_join(message: types.Message):
+    for new_user in message.new_chat_members:
+        await begin_human_verification(
+            message.bot, message.chat, new_user, int(message.date.timestamp()), source="service_join",
+        )
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+def _member_present(member) -> bool:
+    status = getattr(member.status, "value", str(member.status))
+    return status in {"member", "administrator", "creator"} or (
+        status == "restricted" and bool(getattr(member, "is_member", False))
+    )
+
+
+@router.chat_member()
+async def on_membership_change(event: types.ChatMemberUpdated):
+    was_member = _member_present(event.old_chat_member)
+    is_member = _member_present(event.new_chat_member)
+    target = event.new_chat_member.user
+    if not was_member and is_member:
+        if getattr(event.new_chat_member.status, "value", str(event.new_chat_member.status)) in {"creator", "administrator"}:
+            return
+        await begin_human_verification(
+            event.bot, event.chat, target, int(event.date.timestamp()), source="chat_member",
+        )
+    elif was_member and not is_member:
+        await cleanup_departed_verification(event.bot, event.chat.id, target.id)
 
 
 @router.callback_query(F.data.startswith("captcha:"))
 async def confirm_human(callback: CallbackQuery):
+    async with _captcha_lock(callback.message.chat.id, callback.from_user.id):
+        response = await _confirm_human_locked(callback)
+    # Acknowledge outside the input lock: slow Telegram replies cannot stall later digits.
+    try:
+        await callback.answer(**(response or {}))
+    except Exception:
+        _verification_log.warning(
+            "captcha_callback_ack_failed chat=%s user=%s", callback.message.chat.id, callback.from_user.id,
+        )
+
+
+async def _confirm_human_locked(callback: CallbackQuery):
     try:
         _, token, action, *value = callback.data.split(":")
     except (AttributeError, ValueError):
-        return await callback.answer("Некорректная кнопка.", show_alert=True)
+        return {"text": "Некорректная кнопка.", "show_alert": True}
 
     chat_id = callback.message.chat.id
     user_id = callback.from_user.id
     pending = await get_human_verification(chat_id, user_id)
     if not pending or pending.get("challenge_token") != token:
-        return await callback.answer("Эта проверка предназначена другому пользователю.", show_alert=True)
+        return {"text": "Эта проверка предназначена другому пользователю.", "show_alert": True}
 
     if int(pending.get("expires_at") or 0) <= int(time.time()):
         await _kick_after_failed_captcha(
@@ -1052,37 +1191,37 @@ async def confirm_human(callback: CallbackQuery):
             user_id,
             pending.get("welcome_message_id"),
         )
-        return await callback.answer("Время проверки истекло. Войдите в группу повторно.", show_alert=True)
+        return {"text": "Время проверки истекло. Войдите в группу повторно.", "show_alert": True}
 
     entered = pending.get("entered_code") or ""
     if action == "digit":
         digit = value[0] if value else ""
         if digit not in "0123456789" or len(digit) != 1:
-            return await callback.answer("Некорректная кнопка.", show_alert=True)
+            return {"text": "Некорректная кнопка.", "show_alert": True}
         if len(entered) >= CAPTCHA_LENGTH:
-            return await callback.answer("Код уже введён. Нажмите «Готово».")
+            _schedule_captcha_view(callback, token)
+            return
         entered += digit
         await update_human_verification_input(chat_id, user_id, token, entered)
-        return await callback.answer(f"Введено цифр: {len(entered)}/{CAPTCHA_LENGTH}")
+        _schedule_captcha_view(callback, token)
+        return
 
-    if action == "back":
-        entered = entered[:-1]
+    if action in {"back", "clear"}:
+        entered = entered[:-1] if action == "back" else ""
         await update_human_verification_input(chat_id, user_id, token, entered)
-        return await callback.answer(f"Введено цифр: {len(entered)}/{CAPTCHA_LENGTH}")
+        _schedule_captcha_view(callback, token)
+        return
 
     if action != "submit":
-        return await callback.answer("Некорректная кнопка.", show_alert=True)
+        return {"text": "Некорректная кнопка.", "show_alert": True}
 
     if len(entered) != CAPTCHA_LENGTH:
-        return await callback.answer(
-            f"Введите все {CAPTCHA_LENGTH} цифр с картинки.",
-            show_alert=True,
-        )
+        return {"text": f"Введи все {CAPTCHA_LENGTH} цифр с картинки.", "show_alert": True}
 
     if not secrets.compare_digest(entered, pending.get("challenge_code") or ""):
         attempts = await fail_human_verification_attempt(chat_id, user_id, token)
         if attempts is None:
-            return await callback.answer("Проверка уже завершена.", show_alert=True)
+            return {"text": "Проверка уже завершена.", "show_alert": True}
         if attempts >= CAPTCHA_MAX_ATTEMPTS:
             await _kick_after_failed_captcha(
                 callback.bot,
@@ -1090,36 +1229,25 @@ async def confirm_human(callback: CallbackQuery):
                 user_id,
                 pending.get("welcome_message_id"),
             )
-            return await callback.answer("Проверка не пройдена.", show_alert=True)
-        try:
-            await callback.message.edit_caption(
-                caption=_captcha_caption(callback.from_user.mention_html(), attempts),
-                parse_mode="HTML",
-                reply_markup=_captcha_keyboard(token),
-            )
-        except Exception:
-            pass
-        return await callback.answer(
-            f"Неверный код. Осталось попыток: {CAPTCHA_MAX_ATTEMPTS - attempts}.",
-            show_alert=True,
-        )
+            return {"text": "Проверка не пройдена.", "show_alert": True}
+        _schedule_captcha_view(callback, token)
+        return {
+            "text": f"Неверный код. Осталось попыток: {CAPTCHA_MAX_ATTEMPTS - attempts}.",
+            "show_alert": True,
+        }
 
     completed, welcome_message_id = await complete_human_verification(
         chat_id,
         user_id,
+        challenge_token=token,
     )
+    if not completed:
+        return {"text": "Проверка устарела. Используйте текущую картинку.", "show_alert": True}
     _cancel_captcha_timeout(chat_id, user_id)
     await delete_temp_by_scope(
         callback.message,
         key=f"human_verification:{user_id}",
     )
-    if not completed:
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-        return await callback.answer("Вы уже подтвердили вход.")
-
     try:
         await callback.bot.delete_message(callback.message.chat.id, welcome_message_id or callback.message.message_id)
     except Exception:
@@ -1135,7 +1263,7 @@ async def confirm_human(callback: CallbackQuery):
         key=f"verified_welcome:{user_id}",
         parse_mode="HTML",
     )
-    await callback.answer("Проверка пройдена. Теперь можно писать в чат.")
+    _verification_log.info("captcha_passed chat=%s user=%s", chat_id, user_id)
 
 
 @router.message(F.left_chat_member)
@@ -1143,13 +1271,19 @@ async def on_user_leave(message: types.Message):
     left_user = message.left_chat_member
     if not left_user or left_user.is_bot:
         return
-    completed, welcome_message_id = await complete_human_verification(message.chat.id, left_user.id)
-    _cancel_captcha_timeout(message.chat.id, left_user.id)
-    if completed and welcome_message_id:
-        try:
-            await message.bot.delete_message(message.chat.id, welcome_message_id)
-        except Exception:
-            pass
+    await cleanup_departed_verification(message.bot, message.chat.id, left_user.id)
+
+
+async def cleanup_departed_verification(bot, chat_id, user_id):
+    async with _captcha_lock(chat_id, user_id):
+        completed, welcome_message_id = await complete_human_verification(chat_id, user_id)
+        await revoke_chat_verification_access(chat_id, user_id)
+        _cancel_captcha_timeout(chat_id, user_id)
+        if completed and welcome_message_id:
+            try:
+                await bot.delete_message(chat_id, welcome_message_id)
+            except Exception:
+                pass
 
 
 # --- ОСНОВНОЙ ХЕНДЛЕР ТЕКСТА (ФАРМ XP + REP) ---

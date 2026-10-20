@@ -64,13 +64,14 @@ SYNCABLE_TABLES = [
     "farm_players", "farm_cells", "month_scores", "month_results",
     "duel_history", "active_duels", "factory_orders",
     "factory_order_participants", "factory_order_messages", "factory_order_votes",
-    "chat_level_tags", "human_verifications", "data_migrations",
+    "chat_level_tags", "human_verifications", "chat_verification_access", "data_migrations",
 ]
 
 MONTH_PRIZES = (10000, 5000, 2500)
 _month_finalize_lock = asyncio.Lock()
 _month_processor_task = None
 EXTRA_SYNC_COLUMNS = {
+    "chat_verification_access": ("chat_id", "user_id", "verified_at", "joined_at", "source"),
     "month_scores": ("month_key", "user_id", "xp_earned"),
     "month_results": ("month_key", "winner_id", "second_id", "third_id", "finalized_at"),
     "duel_history": ("id", "chat_id", "player1_id", "player2_id", "bet", "result", "commission_rate", "created_at", "resolved_at"),
@@ -456,6 +457,11 @@ async def _ensure_neon_schema():
                 entered_code TEXT DEFAULT '',
                 attempts INTEGER DEFAULT 0,
                 expires_at BIGINT DEFAULT 0,
+                PRIMARY KEY(chat_id,user_id)
+            );
+            CREATE TABLE IF NOT EXISTS chat_verification_access (
+                chat_id BIGINT, user_id BIGINT, verified_at BIGINT NOT NULL,
+                joined_at BIGINT NOT NULL, source TEXT NOT NULL,
                 PRIMARY KEY(chat_id,user_id)
             );
             CREATE TABLE IF NOT EXISTS data_migrations (
@@ -1162,6 +1168,11 @@ async def create_tables():
             expires_at INTEGER DEFAULT 0,
             PRIMARY KEY (chat_id, user_id)
         )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS chat_verification_access (
+            chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            verified_at INTEGER NOT NULL, joined_at INTEGER NOT NULL,
+            source TEXT NOT NULL, PRIMARY KEY(chat_id,user_id)
+        )''')
         for column_sql in (
             "challenge_token TEXT DEFAULT ''",
             "challenge_code TEXT DEFAULT ''",
@@ -1273,12 +1284,17 @@ async def set_human_verification_pending(
     """Create a fresh, one-time in-chat CAPTCHA for a newly joined member."""
     timestamp = int(joined_at or time.time())
     async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
         cursor = await db.execute(
             '''SELECT welcome_message_id FROM human_verifications
                WHERE chat_id = ? AND user_id = ?''',
             (chat_id, user_id),
         )
         old_row = await cursor.fetchone()
+        await db.execute(
+            'DELETE FROM chat_verification_access WHERE chat_id = ? AND user_id = ?',
+            (chat_id, user_id),
+        )
         await db.execute(
             '''INSERT INTO human_verifications
                (chat_id, user_id, welcome_message_id, joined_at,
@@ -1295,8 +1311,55 @@ async def set_human_verification_pending(
             (chat_id, user_id, timestamp, challenge_token, challenge_code, int(expires_at or 0)),
         )
         await db.commit()
-    await _mark_dirty("human_verifications")
+    await _mark_dirty("human_verifications", "chat_verification_access")
     return old_row[0] if old_row and old_row[0] else None
+
+
+async def get_chat_verification_access(chat_id: int, user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        row = await (await db.execute(
+            '''SELECT verified_at, joined_at, source FROM chat_verification_access
+               WHERE chat_id = ? AND user_id = ?''', (chat_id, user_id),
+        )).fetchone()
+    return dict(zip(("verified_at", "joined_at", "source"), row)) if row else None
+
+
+async def revoke_chat_verification_access(chat_id: int, user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            'DELETE FROM chat_verification_access WHERE chat_id=? AND user_id=?',
+            (chat_id, user_id),
+        )
+        await db.commit()
+    if cursor.rowcount:
+        await _mark_dirty("chat_verification_access")
+
+
+async def migrate_existing_chat_access():
+    """Keep established speakers working at rollout; never infer trust on future messages."""
+    key = "explicit_chat_verification_access_v1"
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        exists = await (await db.execute(
+            'SELECT 1 FROM data_migrations WHERE migration_key = ?', (key,),
+        )).fetchone()
+        if exists:
+            await db.rollback()
+            return
+        now = int(time.time())
+        await db.execute(
+            '''INSERT OR IGNORE INTO chat_verification_access
+               (chat_id,user_id,verified_at,joined_at,source)
+               SELECT a.chat_id,a.user_id,?,0,'existing_member'
+               FROM chat_user_activity a
+               WHERE a.message_count >= 3 AND a.first_message_at < ?
+                 AND NOT EXISTS (SELECT 1 FROM human_verifications p
+                     WHERE p.chat_id=a.chat_id AND p.user_id=a.user_id)''',
+            (now, now - 86400),
+        )
+        await db.execute('INSERT INTO data_migrations VALUES (?,?)', (key, now))
+        await db.commit()
+    await _mark_dirty("chat_verification_access", "data_migrations")
 
 
 async def set_human_verification_message(chat_id: int, user_id: int, message_id: int):
@@ -1400,12 +1463,13 @@ async def fail_human_verification_attempt(
     return int(row[0]) if row else None
 
 
-async def complete_human_verification(chat_id: int, user_id: int):
-    """Remove the pending gate and return its welcome message id, if it existed."""
+async def complete_human_verification(chat_id: int, user_id: int, *, challenge_token: str = None):
+    """Clear a challenge; grant access only after atomically checking a supplied token/code."""
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("BEGIN IMMEDIATE")
         cursor = await db.execute(
-            '''SELECT welcome_message_id FROM human_verifications
+            '''SELECT welcome_message_id, joined_at, challenge_token, challenge_code,
+                      entered_code, attempts, expires_at FROM human_verifications
                WHERE chat_id = ? AND user_id = ?''',
             (chat_id, user_id),
         )
@@ -1413,12 +1477,22 @@ async def complete_human_verification(chat_id: int, user_id: int):
         if row is None:
             await db.rollback()
             return False, None
+        if challenge_token is not None:
+            if (row[2] != challenge_token or not row[3] or row[3] != row[4]
+                    or int(row[5] or 0) >= 3 or int(row[6] or 0) <= int(time.time())):
+                await db.rollback()
+                return False, None
+            await db.execute(
+                '''INSERT OR REPLACE INTO chat_verification_access
+                   (chat_id,user_id,verified_at,joined_at,source) VALUES (?,?,?,?,'captcha')''',
+                (chat_id, user_id, int(time.time()), row[1]),
+            )
         await db.execute(
             'DELETE FROM human_verifications WHERE chat_id = ? AND user_id = ?',
             (chat_id, user_id),
         )
         await db.commit()
-    await _mark_dirty("human_verifications")
+    await _mark_dirty("human_verifications", "chat_verification_access")
     return True, row[0]
 
 

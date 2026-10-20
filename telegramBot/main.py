@@ -10,6 +10,7 @@ from config import BOT_TOKEN, COMMANDS
 from database import create_tables, DB_NAME, start_month_processor
 from engagement import create_engagement_tables
 from level_tags import start_level_tag_processor
+from verification_gate import HumanVerificationMiddleware
 
 # Импорт модулей
 from modules import admin, admin_factory, moderation, user, games, factory_orders
@@ -34,6 +35,7 @@ async def main():
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
     dp = Dispatcher()
+    dp.message.outer_middleware(HumanVerificationMiddleware())
 
     # Регистрация роутеров
     dp.include_router(admin.router)
@@ -51,8 +53,9 @@ async def main():
     start_level_tag_processor(bot)
 
     print("Бот запущен. Система уровней 2.0 активирована.")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await bot.delete_webhook(drop_pending_updates=False)
+    allowed_updates = sorted(set(dp.resolve_used_update_types()) | {"chat_member"})
+    await dp.start_polling(bot, allowed_updates=allowed_updates)
 
 if __name__ == "__main__":
     try:
