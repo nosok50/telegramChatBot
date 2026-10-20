@@ -80,7 +80,10 @@ EXTRA_SYNC_COLUMNS = {
     "factory_order_messages": ("order_id", "message_id", "author_id", "parent_author_id"),
     "factory_order_votes": ("order_id", "voter_id", "candidate_id"),
     "chat_level_tags": ("chat_id", "user_id", "applied_level", "retry_after", "last_error"),
-    "human_verifications": ("chat_id", "user_id", "welcome_message_id", "joined_at"),
+    "human_verifications": (
+        "chat_id", "user_id", "welcome_message_id", "joined_at",
+        "challenge_token", "challenge_code", "entered_code", "attempts", "expires_at",
+    ),
     "data_migrations": ("migration_key", "applied_at"),
 }
 
@@ -448,6 +451,11 @@ async def _ensure_neon_schema():
                 user_id BIGINT,
                 welcome_message_id BIGINT,
                 joined_at BIGINT NOT NULL,
+                challenge_token TEXT DEFAULT '',
+                challenge_code TEXT DEFAULT '',
+                entered_code TEXT DEFAULT '',
+                attempts INTEGER DEFAULT 0,
+                expires_at BIGINT DEFAULT 0,
                 PRIMARY KEY(chat_id,user_id)
             );
             CREATE TABLE IF NOT EXISTS data_migrations (
@@ -481,6 +489,11 @@ async def _ensure_neon_schema():
         await conn.execute("ALTER TABLE farm_cells ADD COLUMN IF NOT EXISTS last_collect_ts BIGINT DEFAULT 0")
         await conn.execute("ALTER TABLE farm_cells ADD COLUMN IF NOT EXISTS last_event_check_ts BIGINT DEFAULT 0")
         await conn.execute("ALTER TABLE factory_orders ADD COLUMN IF NOT EXISTS distributed_xp BIGINT DEFAULT 0")
+        await conn.execute("ALTER TABLE human_verifications ADD COLUMN IF NOT EXISTS challenge_token TEXT DEFAULT ''")
+        await conn.execute("ALTER TABLE human_verifications ADD COLUMN IF NOT EXISTS challenge_code TEXT DEFAULT ''")
+        await conn.execute("ALTER TABLE human_verifications ADD COLUMN IF NOT EXISTS entered_code TEXT DEFAULT ''")
+        await conn.execute("ALTER TABLE human_verifications ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0")
+        await conn.execute("ALTER TABLE human_verifications ADD COLUMN IF NOT EXISTS expires_at BIGINT DEFAULT 0")
 
 
 async def _count_local_users() -> int:
@@ -1142,8 +1155,24 @@ async def create_tables():
             user_id INTEGER NOT NULL,
             welcome_message_id INTEGER,
             joined_at INTEGER NOT NULL,
+            challenge_token TEXT DEFAULT '',
+            challenge_code TEXT DEFAULT '',
+            entered_code TEXT DEFAULT '',
+            attempts INTEGER DEFAULT 0,
+            expires_at INTEGER DEFAULT 0,
             PRIMARY KEY (chat_id, user_id)
         )''')
+        for column_sql in (
+            "challenge_token TEXT DEFAULT ''",
+            "challenge_code TEXT DEFAULT ''",
+            "entered_code TEXT DEFAULT ''",
+            "attempts INTEGER DEFAULT 0",
+            "expires_at INTEGER DEFAULT 0",
+        ):
+            try:
+                await db.execute(f"ALTER TABLE human_verifications ADD COLUMN {column_sql}")
+            except Exception:
+                pass
         await db.execute('''CREATE TABLE IF NOT EXISTS data_migrations (
             migration_key TEXT PRIMARY KEY,
             applied_at INTEGER NOT NULL
@@ -1237,8 +1266,11 @@ async def set_human_verification_pending(
     chat_id: int,
     user_id: int,
     joined_at: int = None,
+    challenge_token: str = "",
+    challenge_code: str = "",
+    expires_at: int = 0,
 ):
-    """Require a newly joined member to press their personal verification button."""
+    """Create a fresh, one-time in-chat CAPTCHA for a newly joined member."""
     timestamp = int(joined_at or time.time())
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
@@ -1249,12 +1281,18 @@ async def set_human_verification_pending(
         old_row = await cursor.fetchone()
         await db.execute(
             '''INSERT INTO human_verifications
-               (chat_id, user_id, welcome_message_id, joined_at)
-               VALUES (?, ?, NULL, ?)
+               (chat_id, user_id, welcome_message_id, joined_at,
+                challenge_token, challenge_code, entered_code, attempts, expires_at)
+               VALUES (?, ?, NULL, ?, ?, ?, '', 0, ?)
                ON CONFLICT(chat_id, user_id) DO UPDATE SET
                    welcome_message_id = NULL,
-                   joined_at = excluded.joined_at''',
-            (chat_id, user_id, timestamp),
+                   joined_at = excluded.joined_at,
+                   challenge_token = excluded.challenge_token,
+                   challenge_code = excluded.challenge_code,
+                   entered_code = '',
+                   attempts = 0,
+                   expires_at = excluded.expires_at''',
+            (chat_id, user_id, timestamp, challenge_token, challenge_code, int(expires_at or 0)),
         )
         await db.commit()
     await _mark_dirty("human_verifications")
@@ -1282,6 +1320,84 @@ async def is_human_verification_pending(chat_id: int, user_id: int) -> bool:
             (chat_id, user_id),
         )
         return await cursor.fetchone() is not None
+
+
+async def get_human_verification(chat_id: int, user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            '''SELECT chat_id, user_id, welcome_message_id, joined_at,
+                      challenge_token, challenge_code, entered_code, attempts, expires_at
+               FROM human_verifications
+               WHERE chat_id = ? AND user_id = ?''',
+            (chat_id, user_id),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        keys = (
+            "chat_id", "user_id", "welcome_message_id", "joined_at",
+            "challenge_token", "challenge_code", "entered_code", "attempts", "expires_at",
+        )
+        return dict(zip(keys, row))
+
+
+async def get_pending_human_verifications():
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            '''SELECT chat_id, user_id, welcome_message_id, joined_at,
+                      challenge_token, challenge_code, entered_code, attempts, expires_at
+               FROM human_verifications'''
+        )
+        keys = (
+            "chat_id", "user_id", "welcome_message_id", "joined_at",
+            "challenge_token", "challenge_code", "entered_code", "attempts", "expires_at",
+        )
+        return [dict(zip(keys, row)) for row in await cursor.fetchall()]
+
+
+async def update_human_verification_input(
+    chat_id: int,
+    user_id: int,
+    challenge_token: str,
+    entered_code: str,
+):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            '''UPDATE human_verifications SET entered_code = ?
+               WHERE chat_id = ? AND user_id = ? AND challenge_token = ?''',
+            (entered_code, chat_id, user_id, challenge_token),
+        )
+        await db.commit()
+    if cursor.rowcount:
+        await _mark_dirty("human_verifications")
+    return bool(cursor.rowcount)
+
+
+async def fail_human_verification_attempt(
+    chat_id: int,
+    user_id: int,
+    challenge_token: str,
+):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            '''UPDATE human_verifications
+               SET attempts = attempts + 1, entered_code = ''
+               WHERE chat_id = ? AND user_id = ? AND challenge_token = ?''',
+            (chat_id, user_id, challenge_token),
+        )
+        if not cursor.rowcount:
+            await db.rollback()
+            return None
+        cursor = await db.execute(
+            '''SELECT attempts FROM human_verifications
+               WHERE chat_id = ? AND user_id = ?''',
+            (chat_id, user_id),
+        )
+        row = await cursor.fetchone()
+        await db.commit()
+    await _mark_dirty("human_verifications")
+    return int(row[0]) if row else None
 
 
 async def complete_human_verification(chat_id: int, user_id: int):

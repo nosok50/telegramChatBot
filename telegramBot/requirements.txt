@@ -3,3 +3,4 @@ aiosqlite
 asyncpg
 flask
 python-dotenv
+Pillow>=10.1,<13

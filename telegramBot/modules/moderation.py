@@ -167,7 +167,7 @@ def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
             "кидайте", "ставьплюс", "отклик",
         ))
         has_mass_offer = any(token in value for token in (
-            "раздаю", "каждому", "первым", "всемдам", "скину", "дамденег",
+            "раздаю", "каждому", "первым", "всемдам", "дамденег",
         ))
         has_loan_offer = any(token in value for token in (
             "дамвдолг", "даювдолг", "выдамвдолг", "дамзайм",
@@ -224,7 +224,7 @@ def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
         ))
         has_mass_offer = bool(re.search(
             r"\b(?:раздаю|каждому|первым\s*\d*|всем\s+(?:дам|скину)|"
-            r"скину|дам\s+денег)\b",
+            r"дам\s+денег)\b",
             normalized,
         ))
         has_loan_offer = bool(re.search(
@@ -279,6 +279,16 @@ def _advertising_score(text: str, whitelist=None, compact: bool = False) -> int:
             r"\b(?:закладк\w*|клад\w*|меф\w*|шишк\w*|грамм\w*)\b",
             normalized,
         ))
+
+    # Contact phrases and generic verbs do not establish an advertising offer.
+    # Require a subject (money, work, goods) or an external destination first.
+    if not any((
+        has_link, has_bot_handle, has_money, has_work, has_recruitment,
+        has_loan_offer, has_earning_lure, has_cash_lure,
+        has_suspicious_logistics, has_drug,
+        has_mass_offer and bool(re.search(r"ден(?:ег|ьг)", normalized)),
+    )):
+        return 0
 
     score = sum((
         2 if has_link else 0,
@@ -358,6 +368,10 @@ class AutoModerationTracker:
         strict_newcomer: bool = False,
     ):
         now = time.time()
+        # RPG level is independent of moderator rights. Established players need
+        # stronger evidence, and their full messages are not joined into an ad.
+        strict_newcomer = strict_newcomer and user_level <= 1
+        advertising_threshold = 4 if user_level <= 1 else 6
         key = (chat_id, user_id)
         history = [item for item in self.messages.get(key, []) if now - item["time"] <= 60]
         normalized = _plain_text(text)
@@ -374,8 +388,10 @@ class AutoModerationTracker:
             and _is_short_loan_bait(normalized)
         )
         is_direct_newcomer_action = strict_newcomer and _has_newcomer_action(normalized)
-        if is_direct_newcomer_action or is_untrusted_loan_bait or _advertising_score(normalized, whitelist) >= 4 or (
-            len(recent_text) >= 2 and _advertising_score(combined, whitelist) >= 4
+        if is_direct_newcomer_action or is_untrusted_loan_bait or _advertising_score(normalized, whitelist) >= advertising_threshold or (
+            user_level <= 1
+            and len(recent_text) >= 2
+            and _advertising_score(combined, whitelist) >= advertising_threshold
         ):
             return {
                 "action": "advertising",
@@ -395,7 +411,7 @@ class AutoModerationTracker:
                 ids = [item["id"] for item in short_parts]
                 self._remove_ids(key, ids)
                 return {"action": "split_badword", "ids": ids}
-            if len(short_parts) >= 3 and _advertising_score(joined_short, whitelist, compact=True) >= 4:
+            if len(short_parts) >= 3 and _advertising_score(joined_short, whitelist, compact=True) >= advertising_threshold:
                 ids = [item["id"] for item in short_parts]
                 self._remove_ids(key, ids)
                 return {
@@ -490,7 +506,7 @@ class FloodMiddleware(BaseMiddleware):
                     pass
                 await answer_temp(
                     event,
-                    "🧩 Сначала нажмите кнопку <b>«Я человек»</b> в приветственном сообщении.",
+                    "🧩 Сначала введите код с картинки в сообщении проверки.",
                     key=f"human_verification:{event.from_user.id}",
                 )
                 return

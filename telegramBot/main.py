@@ -46,6 +46,7 @@ async def main():
     await bot.set_my_commands(COMMANDS, scope=BotCommandScopeDefault())
     factory_orders.start_factory_processor(bot)
     games.start_duel_processor(bot)
+    await user.start_human_verification_processor(bot)
     start_month_processor()
     start_level_tag_processor(bot)
 
